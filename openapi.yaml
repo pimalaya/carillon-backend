@@ -16,9 +16,9 @@ info:
 servers:
   - url: http://127.0.0.1:3000
     description: Self-host (localhost)
-# Default: every operation requires the bearer token (capability link or admin
-# token). Public onboarding/health/billing-callback routes opt out with an
-# explicit empty `security: []`.
+# Default: every operation requires the bearer token (a capability link).
+# Public onboarding/health/billing-callback routes opt out with an explicit
+# empty `security: []`.
 security:
   - capabilityLink: []
 tags:
@@ -30,14 +30,6 @@ tags:
   - name: accounts
   - name: billing
   - name: stream
-  - name: admin
-    description: |
-      Localhost-only admin console. These routes are served on a SEPARATE
-      loopback listener (`[admin] listen`, default 127.0.0.1:3001), NOT on
-      the public control API — a request to an admin path on the public
-      listener 404s. Reach them only via an SSH tunnel / SOCKS proxy to the
-      admin listener. Each requires an admin identity: a capability session
-      whose account email is in `[admin] emails`, or the `api.admin_token`.
 
 paths:
   /:
@@ -743,127 +735,6 @@ paths:
               schema: { $ref: "#/components/schemas/AccountView" }
         "404": { description: No such account. }
 
-  /admin/overview:
-    get:
-      tags: [admin]
-      summary: Fleet totals (admin console, loopback listener only)
-      description: |
-        Account count, recent signups over a fixed window, and the
-        aggregate credit pool. Served only on the loopback admin listener.
-      responses:
-        "200":
-          description: Fleet totals.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  total_accounts: { type: integer }
-                  recent_signups: { type: integer }
-                  signup_window_secs: { type: integer }
-                  total_credits: { type: integer }
-        "403": { description: Not an admin identity. }
-  /admin/accounts:
-    get:
-      tags: [admin]
-      summary: List every account for administration (loopback listener only)
-      responses:
-        "200":
-          description: Every account, newest first.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  accounts:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id: { type: string }
-                        email: { type: string, nullable: true }
-                        credits: { type: integer }
-                        created_at: { type: integer, nullable: true }
-                        blocked: { type: boolean }
-                        watch_count: { type: integer }
-        "403": { description: Not an admin identity. }
-  /admin/accounts/{id}/watches:
-    get:
-      tags: [admin]
-      summary: One account's watches (admin console, loopback listener only)
-      description: |
-        Lazy-loaded when the console expands a user's row. Reuses the
-        standard watch view.
-      parameters: [{ $ref: "#/components/parameters/AccountId" }]
-      responses:
-        "200":
-          description: The account's watches.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/WatchView" }
-        "403": { description: Not an admin identity. }
-  /admin/accounts/{id}/credits:
-    post:
-      tags: [admin]
-      summary: Manually adjust an account's credit balance (loopback listener only)
-      parameters: [{ $ref: "#/components/parameters/AccountId" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [delta]
-              properties:
-                delta:
-                  type: integer
-                  description: Credits to add (positive) or remove (negative).
-      responses:
-        "200":
-          description: New balance.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status: { type: string }
-                  id: { type: string }
-                  credits: { type: integer }
-        "403": { description: Not an admin identity. }
-        "409": { description: Insufficient credits to remove. }
-  /admin/accounts/{id}/block:
-    post:
-      tags: [admin]
-      summary: Blacklist or un-blacklist an account (loopback listener only)
-      description: |
-        A blocked account is refused at auth and cannot mint a session or
-        create watches.
-      parameters: [{ $ref: "#/components/parameters/AccountId" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [blocked]
-              properties:
-                blocked: { type: boolean }
-      responses:
-        "200":
-          description: Updated blacklist state.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status: { type: string }
-                  id: { type: string }
-                  blocked: { type: boolean }
-        "403": { description: Not an admin identity. }
-        "404": { description: No such account. }
-
   /events:
     get:
       tags: [stream]
@@ -885,13 +756,10 @@ components:
       type: http
       scheme: bearer
       description: >
-        The bearer token behind `Authorization: Bearer <token>`. Normally a
-        per-account **capability link**, which scopes every data route to that
-        account's own watches, deliveries, events and pool. A deployment may
-        also configure a master **admin token** (`api.admin_token`) that this
-        same scheme accepts for **unscoped** fleet-wide access (ops / headless
-        self-host). Every data route requires one of these; there is no
-        unauthenticated access to watches, deliveries or events.
+        The bearer token behind `Authorization: Bearer <token>`: a per-account
+        **capability link**, which scopes every data route to that account's own
+        watches, deliveries, events and pool. Every data route requires one;
+        there is no unauthenticated access to watches, deliveries or events.
   parameters:
     WatchId:
       name: id

@@ -68,6 +68,9 @@ Carillon SHALL expose administrative routes only on a second listener bound to a
 - **WHEN** they request an admin route with a valid admin identity
 - **THEN** the admin router serves it
 
+### Requirement: The public API does not disclose the admin console
+The publicly-served OpenAPI contract (`GET /openapi.yaml`, delivered raw) SHALL NOT document — or even mention in a comment — the loopback-only admin console, its routes, or the admin listener address. Advertising them on the public surface is needless reconnaissance; the admin API lives only on the loopback listener. Server error responses (HTTP 500) SHALL return a generic body (`{"error":"internal error"}`) with the real cause logged server-side, never the internal error string, so a public failure cannot leak SQL text, host names, or filesystem paths.
+
 ### Requirement: AdminCaller requires network position AND identity
 Every admin route SHALL be gated by an `AdminCaller` extractor that authorizes a request only when it (a) arrived on the loopback admin listener AND (b) carries either a capability-link session whose account email is in `[admin] emails`, or the configured `api.admin_token`. Neither identity alone, presented on the public listener, SHALL reach any admin verb. A missing bearer is rejected `401`; a present-but-unauthorized bearer is rejected `403`.
 

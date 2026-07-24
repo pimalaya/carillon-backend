@@ -30,7 +30,7 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::billing::{self, Billing};
 use crate::carddav::session::{CardDavAccount, CardDavAuth};
@@ -57,7 +57,10 @@ const DEFAULT_ROTATE_OVERLAP: Duration = Duration::from_secs(24 * 60 * 60);
 const CAPABILITY_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// This server's OpenAPI contract, embedded so it is always served in
-/// sync with the binary.
+/// sync with the binary. Served RAW and PUBLICLY at `GET /openapi.yaml`,
+/// so it MUST NOT document (or even mention in a comment) the loopback-only
+/// admin console — that would be needless reconnaissance. Keep `/admin/*`
+/// out of this file.
 const OPENAPI_YAML: &str = include_str!("../openapi.yaml");
 
 /// Shared handler state.
@@ -2775,9 +2778,14 @@ struct AppError(anyhow::Error);
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // NOTE: log the real cause server-side, but return a GENERIC body to
+        // the client. The anyhow chain can carry internal detail (SQL text,
+        // host names, filesystem paths); leaking it on a public 500 is
+        // needless disclosure. See cairn/spec/auth.md.
+        error!(error = %self.0, "request failed");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": self.0.to_string() })),
+            Json(json!({ "error": "internal error" })),
         )
             .into_response()
     }

@@ -90,13 +90,38 @@ complete sign-in ON the tunnel origin the operator swaps the verify URL's host t
 the tunnel (`127.0.0.1:3001`) — the token is origin-independent. A dedicated admin
 verify URL could automate this later.
 
+## Follow-up: external-exposure hardening (same day)
+
+An external-leak audit of the public surface turned up two disclosures, both fixed:
+- **OpenAPI advertised the admin console.** `GET /openapi.yaml` is served raw and
+  publicly, and it documented the `/admin/*` routes plus the `127.0.0.1:3001`
+  listener address — free reconnaissance. Removed every admin path, the `admin`
+  tag, and even the explanatory comment (the file is served verbatim). A source
+  comment on `OPENAPI_YAML` warns against re-adding it. Served file now has zero
+  admin references.
+- **`AppError` leaked internal error strings.** The 500 handler returned
+  `self.0.to_string()` (the anyhow chain — could carry SQL text, host names,
+  paths). Now logs the cause server-side and returns a generic
+  `{"error":"internal error"}`.
+
+Two residuals were then also closed on request: the `api.admin_token` mention was
+trimmed from the OpenAPI (the `capabilityLink` scheme description and the header
+comment) so the served contract has ZERO admin references; and the frontend `/admin`
+route was code-split (route `lazy`) so the admin code and `/admin/*` paths leave the
+main public bundle (they now live only in a separate `AdminPage-*.js` chunk).
+
+Confirmed benign / pre-existing: onboarding routes echo the caller's own
+input-validation / IMAP errors (intentional client feedback); the split admin chunk
+is still served as a static asset (the loopback bind, not obscurity, is the control).
+
 ## Capabilities moved
 
 - **auth** — MODIFIED "The Caller extractor resolves the bearer" (admin_token also
   authorizes the loopback console). ADDED "Admin console is served on a
   loopback-only listener", "AdminCaller requires network position AND identity",
   "Admin console manages users, credits, and blacklist", "A blocked account is
-  inert". ADDED "Dev-only open admin console is compiled out of release".
+  inert". ADDED "Dev-only open admin console is compiled out of release". ADDED
+  "The public API does not disclose the admin console".
 
 ## Not done here
 
