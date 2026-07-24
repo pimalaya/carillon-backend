@@ -27,6 +27,9 @@ pub struct Config {
     /// Control API settings.
     #[serde(default)]
     pub api: ApiConfig,
+    /// Localhost-only admin console settings.
+    #[serde(default)]
+    pub admin: AdminConfig,
     /// OAuth client overrides (own registered apps instead of the
     /// built-in Thunderbird public clients).
     #[serde(default)]
@@ -351,6 +354,50 @@ impl Default for ApiConfig {
     }
 }
 
+/// Localhost-only admin console settings.
+///
+/// The admin console is served on a SECOND listener, distinct from the
+/// public control API, bound to a loopback address so the destructive
+/// management verbs (credit-adjust, blacklist) are unreachable from the
+/// public internet. The only intended access path is host-level: an
+/// `ssh -L` tunnel or a SOCKS proxy to `listen`. A request is authorized
+/// only when it arrives on this listener AND carries either a
+/// capability-link session whose account email is in [`AdminConfig::emails`],
+/// or the `api.admin_token` (break-glass). See `cairn/spec/auth.md`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdminConfig {
+    /// Listen address of the admin console. MUST be a loopback address
+    /// (`127.0.0.1` / `::1`); it is never fronted by the public reverse
+    /// proxy. Defaults to `127.0.0.1:3001`.
+    #[serde(default = "default_admin_listen")]
+    pub listen: String,
+    /// Emails allowed to use the admin console. A capability-link session
+    /// whose account email is in this list is an admin on the loopback
+    /// listener. Empty (the default) means only `api.admin_token`
+    /// authorizes the console.
+    #[serde(default)]
+    pub emails: Vec<String>,
+    /// DEV ONLY. When `true` AND the binary is a debug build (`cargo
+    /// run`), the admin console skips authentication and is also mounted
+    /// on the public listener, so a `npm run dev` frontend can reach it
+    /// without a token or sign-in. IGNORED in release builds (the compiled
+    /// production binary has no such bypass). NEVER set this in production:
+    /// behind a reverse proxy every request looks local, so an open admin
+    /// console would be world-writable. Default `false`.
+    #[serde(default)]
+    pub dev_allow_insecure: bool,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_admin_listen(),
+            emails: Vec::new(),
+            dev_allow_insecure: false,
+        }
+    }
+}
+
 /// A file of accounts to import into the store, consumed by `carillon
 /// import`.
 ///
@@ -473,6 +520,10 @@ fn default_carddav_poll_secs() -> u64 {
 
 fn default_listen() -> String {
     String::from("127.0.0.1:3000")
+}
+
+fn default_admin_listen() -> String {
+    String::from("127.0.0.1:3001")
 }
 
 fn default_port() -> u16 {

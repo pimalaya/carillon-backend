@@ -141,7 +141,13 @@ CREATE TABLE IF NOT EXISTS account (
   credits       INTEGER NOT NULL DEFAULT 0,
   -- Set once the account's one free credit has been granted (on its first
   -- validated PIM account), so it is never granted twice.
-  free_credited INTEGER NOT NULL DEFAULT 0
+  free_credited INTEGER NOT NULL DEFAULT 0,
+  -- Unix seconds the account row was first created; powers the admin
+  -- signups view. Null for rows predating the column (backfilled on migrate).
+  created_at    INTEGER,
+  -- Blacklist flag (§ auth): a blocked account is refused at auth and
+  -- cannot mint/refresh a session or create watches. Set by the admin console.
+  blocked       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS account_email ON account (email);
@@ -369,6 +375,12 @@ pub struct AccountRow {
     pub email: Option<String>,
     /// Fungible credit-pool balance (one credit = one PIM-account-month).
     pub credits: i64,
+    /// Unix seconds the account was created. `None` for rows predating
+    /// the column that had no mailbox to backfill from.
+    pub created_at: Option<i64>,
+    /// Whether the account is blacklisted (§ auth): blocked accounts are
+    /// refused at auth and cannot mint sessions or create watches.
+    pub blocked: bool,
 }
 
 impl AccountRow {
@@ -377,6 +389,8 @@ impl AccountRow {
             id: row.get("id")?,
             email: row.get("email")?,
             credits: row.get("credits")?,
+            created_at: row.get("created_at")?,
+            blocked: row.get::<_, i64>("blocked")? != 0,
         })
     }
 }
@@ -699,8 +713,8 @@ impl Store {
     /// whether the account was newly created.
     pub fn ensure_account(&self, id: &str, email: Option<&str>) -> Result<bool> {
         let created = self.lock().execute(
-            "INSERT OR IGNORE INTO account (id, email) VALUES (?1, ?2)",
-            params![id, email],
+            "INSERT OR IGNORE INTO account (id, email, created_at) VALUES (?1, ?2, ?3)",
+            params![id, email, now_secs()],
         )?;
         Ok(created > 0)
     }
@@ -768,7 +782,7 @@ impl Store {
         let conn = self.lock();
         let account = conn
             .query_row(
-                "SELECT id, email, credits FROM account WHERE id = ?1",
+                "SELECT id, email, credits, created_at, blocked FROM account WHERE id = ?1",
                 [id],
                 AccountRow::from_row,
             )
@@ -798,8 +812,8 @@ impl Store {
     pub fn add_credits(&self, account_id: &str, n: i64) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT OR IGNORE INTO account (id) VALUES (?1)",
-            [account_id],
+            "INSERT OR IGNORE INTO account (id, created_at) VALUES (?1, ?2)",
+            params![account_id, now_secs()],
         )?;
         conn.execute(
             "UPDATE account SET credits = credits + ?2 WHERE id = ?1",
@@ -830,6 +844,92 @@ impl Store {
             params![account_id, n],
         )?;
         Ok(rows > 0)
+    }
+
+    /// Every account with its full admin view (id, email, credits,
+    /// created_at, blocked), newest first (nulls last). Backs the admin
+    /// console's user list.
+    pub fn list_accounts_admin(&self) -> Result<Vec<AccountRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, email, credits, created_at, blocked
+             FROM account ORDER BY created_at DESC NULLS LAST, id",
+        )?;
+        let rows = stmt.query_map([], AccountRow::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Per-account watch count (`account_id` → number of watches). Backs
+    /// the admin user list's "watches" column; accounts with no watches
+    /// are absent (the caller defaults them to zero).
+    pub fn account_watch_counts(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT account_id, COUNT(*) FROM watch GROUP BY account_id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Total number of accounts, and how many were created at/after
+    /// `since` (Unix seconds). Backs the admin signups summary.
+    pub fn signup_counts(&self, since: i64) -> Result<(i64, i64)> {
+        let conn = self.lock();
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM account", [], |r| r.get(0))?;
+        let recent: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM account WHERE created_at >= ?1",
+            [since],
+            |r| r.get(0),
+        )?;
+        Ok((total, recent))
+    }
+
+    /// Sum of every account's credit balance (the fleet-wide pool). Backs
+    /// the admin credits aggregate.
+    pub fn total_credits(&self) -> Result<i64> {
+        let conn = self.lock();
+        let total: i64 =
+            conn.query_row("SELECT COALESCE(SUM(credits), 0) FROM account", [], |r| {
+                r.get(0)
+            })?;
+        Ok(total)
+    }
+
+    /// Sets or clears an account's blacklist flag. Returns whether a row
+    /// matched (the account exists).
+    pub fn set_blocked(&self, account_id: &str, blocked: bool) -> Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE account SET blocked = ?2 WHERE id = ?1",
+            params![account_id, i64::from(blocked)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether an account is blacklisted. A missing account is not blocked
+    /// (`false`), so this is safe to call before the account row exists.
+    pub fn is_blocked(&self, account_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let blocked: Option<i64> = conn
+            .query_row(
+                "SELECT blocked FROM account WHERE id = ?1",
+                [account_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(blocked.unwrap_or(0) != 0)
+    }
+
+    /// Whether the account bearing `email` is blacklisted. Used at the
+    /// magic-link identity boundary, before an account id is resolved.
+    pub fn email_is_blocked(&self, email: &str) -> Result<bool> {
+        let conn = self.lock();
+        let blocked: Option<i64> = conn
+            .query_row(
+                "SELECT blocked FROM account WHERE email = ?1 ORDER BY rowid LIMIT 1",
+                [email],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(blocked.unwrap_or(0) != 0)
     }
 
     /// Stores a pending magic-link token (by hash) for an email address.
@@ -1352,6 +1452,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("account", "email", "TEXT"),
         ("account", "credits", "INTEGER NOT NULL DEFAULT 0"),
         ("account", "free_credited", "INTEGER NOT NULL DEFAULT 0"),
+        // NOTE: admin console — signups view + blacklist.
+        ("account", "created_at", "INTEGER"),
+        ("account", "blocked", "INTEGER NOT NULL DEFAULT 0"),
         // NOTE: per-service activation state lives on the watch (the
         // billed unit).
         ("watch", "watching_until", "INTEGER"),
@@ -1382,6 +1485,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     // NOTE: backfill the billing account for pre-metering rows: one
     // watch, one account, sharing the id.
     conn.execute("UPDATE watch SET account_id = id WHERE account_id = ''", [])?;
+    // NOTE: backfill created_at for accounts predating the column from
+    // their earliest PIM-account membership, so the signups view has a
+    // best-effort age. Accounts with no membership stay null (unknown).
+    conn.execute(
+        "UPDATE account SET created_at = (
+             SELECT MIN(added_at) FROM account_mailbox WHERE account_mailbox.account_id = account.id
+         ) WHERE created_at IS NULL",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1419,6 +1531,52 @@ mod tests {
         assert!(store.grant_free_credit("acc", 1).unwrap()); // fires
         assert!(!store.grant_free_credit("acc", 1).unwrap()); // idempotent
         assert_eq!(store.get_account("acc").unwrap().unwrap().credits, 1);
+    }
+
+    #[test]
+    fn blacklist_flag_round_trips() {
+        let store = temp_store();
+        store.ensure_account("acc", Some("a@b.test")).unwrap();
+
+        // Not blocked by default; a missing account reads as not blocked.
+        assert!(!store.is_blocked("acc").unwrap());
+        assert!(!store.is_blocked("nope").unwrap());
+        assert!(!store.email_is_blocked("a@b.test").unwrap());
+
+        // Block, then confirm both id- and email-keyed lookups agree.
+        assert!(store.set_blocked("acc", true).unwrap());
+        assert!(store.is_blocked("acc").unwrap());
+        assert!(store.email_is_blocked("a@b.test").unwrap());
+        assert!(store.get_account("acc").unwrap().unwrap().blocked);
+
+        // Unblock clears it; blocking an unknown account matches no row.
+        assert!(store.set_blocked("acc", false).unwrap());
+        assert!(!store.is_blocked("acc").unwrap());
+        assert!(!store.set_blocked("nope", true).unwrap());
+    }
+
+    #[test]
+    fn admin_summaries_count_accounts_and_credits() {
+        let store = temp_store();
+        store.ensure_account("a", Some("a@x.test")).unwrap();
+        store.ensure_account("b", Some("b@x.test")).unwrap();
+        store.add_credits("a", 5).unwrap();
+        store.add_credits("b", 3).unwrap();
+
+        // Both accounts were just created, so both fall in a recent window.
+        let (total, recent) = store.signup_counts(now_secs() - 3600).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(recent, 2);
+        // A future cutoff excludes them from "recent" but not the total.
+        let (total, recent) = store.signup_counts(now_secs() + 3600).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(recent, 0);
+
+        assert_eq!(store.total_credits().unwrap(), 8);
+        assert_eq!(store.list_accounts_admin().unwrap().len(), 2);
+
+        // No watches yet, so the count map is empty (callers default to 0).
+        assert!(store.account_watch_counts().unwrap().is_empty());
     }
 
     #[test]

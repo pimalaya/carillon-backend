@@ -99,7 +99,17 @@ pub struct AppState {
     /// Optional master token granting unscoped access to every account
     /// (ops / headless self-host). `None` means no unscoped access
     /// exists; every data route is reachable only via a capability link.
+    /// Also authorizes the loopback admin console as a break-glass
+    /// identity (see [`AdminCaller`]).
     pub admin_token: Option<String>,
+    /// Emails allowed to use the loopback admin console. A capability
+    /// session whose account email is in this set is an admin on the
+    /// admin listener. Empty means only `admin_token` authorizes it.
+    pub admin_emails: Arc<std::collections::HashSet<String>>,
+    /// DEV ONLY. When `true`, `AdminCaller` authorizes with no credential
+    /// (see `[admin] dev_allow_insecure`). Set only for a debug-build
+    /// `cargo run`; `main::serve` forces it `false` in release builds.
+    pub admin_dev_open: bool,
     /// Public base URL of this API; the OAuth redirect URI is
     /// `{public_url}/oauth/callback`.
     pub public_url: String,
@@ -115,7 +125,12 @@ pub struct AppState {
 /// files at the origin (self-host embedding a `carillon-frontend` build);
 /// `cors_origin`, if set, enables cross-origin access for a CDN-served
 /// front.
-pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<String>) -> Router {
+pub fn router(
+    state: AppState,
+    ui_dir: Option<PathBuf>,
+    cors_origin: Option<String>,
+    mount_admin: bool,
+) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/openapi.yaml", get(openapi))
@@ -149,6 +164,15 @@ pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<Stri
         .route("/billing/checkout", post(billing_checkout))
         .route("/billing/webhook", post(billing_webhook));
 
+    // NOTE: mount the admin routes when asked. `main::serve` sets this
+    // `true` for the loopback listener (always) and, in a dev build with
+    // `[admin] dev_allow_insecure`, for the public listener too. The
+    // production public listener never mounts admin, so an admin path
+    // there `404`s.
+    if mount_admin {
+        app = app.merge(admin_routes());
+    }
+
     // NOTE: with a UI, static files own `/` (unknown paths fall back to
     // the SPA entrypoint); without one, `/` returns service metadata.
     app = match &ui_dir {
@@ -168,6 +192,164 @@ pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<Stri
     }
 
     app
+}
+
+/// How far back the admin signups summary counts recent accounts.
+const ADMIN_SIGNUP_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// The admin console's routes, merged into [`router`] when `mount_admin`
+/// is set — always on the loopback listener, and additionally on the
+/// public listener in a dev build with `[admin] dev_allow_insecure`. Every
+/// route is gated by [`AdminCaller`]. See `cairn/spec/auth.md`.
+fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/admin/overview", get(admin_overview))
+        .route("/admin/accounts", get(admin_accounts))
+        .route("/admin/accounts/{id}/watches", get(admin_account_watches))
+        .route("/admin/accounts/{id}/credits", post(admin_adjust_credits))
+        .route("/admin/accounts/{id}/block", post(admin_set_blocked))
+}
+
+/// `GET /admin/overview`: fleet totals for the admin console — account
+/// count, recent signups, and the aggregate credit pool.
+async fn admin_overview(
+    State(state): State<AppState>,
+    _admin: AdminCaller,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let store = state.store.clone();
+    let body = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let since = now_secs() - ADMIN_SIGNUP_WINDOW_SECS;
+        let (total_accounts, recent_signups) = store.signup_counts(since)?;
+        let total_credits = store.total_credits()?;
+        Ok(json!({
+            "total_accounts": total_accounts,
+            "recent_signups": recent_signups,
+            "signup_window_secs": ADMIN_SIGNUP_WINDOW_SECS,
+            "total_credits": total_credits,
+        }))
+    })
+    .await??;
+    Ok(Json(body))
+}
+
+/// `GET /admin/accounts`: every account with its email, credit balance,
+/// creation time, and blacklist flag, newest first.
+async fn admin_accounts(
+    State(state): State<AppState>,
+    _admin: AdminCaller,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let store = state.store.clone();
+    let body = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let counts = store.account_watch_counts()?;
+        let accounts: Vec<_> = store
+            .list_accounts_admin()?
+            .into_iter()
+            .map(|a| {
+                let watch_count = counts.get(&a.id).copied().unwrap_or(0);
+                json!({
+                    "id": a.id,
+                    "email": a.email,
+                    "credits": a.credits,
+                    "created_at": a.created_at,
+                    "blocked": a.blocked,
+                    "watch_count": watch_count,
+                })
+            })
+            .collect();
+        Ok(json!({ "accounts": accounts }))
+    })
+    .await??;
+    Ok(Json(body))
+}
+
+/// `GET /admin/accounts/{id}/watches`: every watch owned by one account,
+/// lazy-loaded when the admin console expands that user's row.
+async fn admin_account_watches(
+    State(state): State<AppState>,
+    _admin: AdminCaller,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<WatchView>>, AppError> {
+    let store = state.store.clone();
+    let watches = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<WatchView>> {
+        Ok(store
+            .watches_by_account(&id)?
+            .into_iter()
+            .map(WatchView::from)
+            .collect())
+    })
+    .await??;
+    Ok(Json(watches))
+}
+
+/// Body of `POST /admin/accounts/{id}/credits`: signed credit delta.
+#[derive(Deserialize)]
+struct AdminCreditAdjust {
+    /// Credits to add (positive) or remove (negative). A negative delta
+    /// is all-or-nothing: it never drives a balance below zero.
+    delta: i64,
+}
+
+/// `POST /admin/accounts/{id}/credits`: manually add or remove credits on
+/// an account. A negative delta beyond the balance is refused (`409`).
+async fn admin_adjust_credits(
+    State(state): State<AppState>,
+    admin: AdminCaller,
+    Path(id): Path<String>,
+    Json(request): Json<AdminCreditAdjust>,
+) -> Result<Response, AppError> {
+    let store = state.store.clone();
+    let account_id = id.clone();
+    let delta = request.delta;
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<i64>> {
+        if delta >= 0 {
+            store.add_credits(&account_id, delta)?;
+        } else if !store.debit_credits(&account_id, -delta)? {
+            // NOTE: not enough credits to remove `-delta`.
+            return Ok(None);
+        }
+        Ok(store.get_account(&account_id)?.map(|a| a.credits))
+    })
+    .await??;
+
+    Ok(match outcome {
+        Some(credits) => {
+            info!(account = %id, delta, by = %admin.identity, "admin credit adjust");
+            Json(json!({ "status": "ok", "id": id, "credits": credits })).into_response()
+        }
+        None => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "insufficient credits to remove" })),
+        )
+            .into_response(),
+    })
+}
+
+/// Body of `POST /admin/accounts/{id}/block`: the desired blacklist state.
+#[derive(Deserialize)]
+struct AdminBlock {
+    blocked: bool,
+}
+
+/// `POST /admin/accounts/{id}/block`: blacklist or un-blacklist an
+/// account. A blocked account is refused at auth and cannot mint a
+/// session or create watches (§ auth). `404` when the account is unknown.
+async fn admin_set_blocked(
+    State(state): State<AppState>,
+    admin: AdminCaller,
+    Path(id): Path<String>,
+    Json(request): Json<AdminBlock>,
+) -> Result<Response, AppError> {
+    let store = state.store.clone();
+    let account_id = id.clone();
+    let blocked = request.blocked;
+    let matched =
+        tokio::task::spawn_blocking(move || store.set_blocked(&account_id, blocked)).await??;
+
+    if !matched {
+        return Ok(not_found(&id));
+    }
+    info!(account = %id, blocked, by = %admin.identity, "admin block");
+    Ok(Json(json!({ "status": "ok", "id": id, "blocked": blocked })).into_response())
 }
 
 /// Service metadata for the root path (self-host without a UI).
@@ -1089,6 +1271,11 @@ struct WatchView {
     mailbox: String,
     notify_url: String,
     active: bool,
+    /// Paid-through time (Unix seconds): the service watches, when
+    /// metered, only while this is in the future. `None`/absent when never
+    /// activated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watching_until: Option<i64>,
     /// CardDAV collection URL (`None`/absent for IMAP).
     #[serde(skip_serializing_if = "Option::is_none")]
     carddav_url: Option<String>,
@@ -1111,6 +1298,7 @@ impl From<Watch> for WatchView {
             mailbox: watch.mailbox,
             notify_url: watch.notify_url,
             active: watch.active,
+            watching_until: watch.watching_until,
             carddav_url: watch.carddav_url,
         }
     }
@@ -1708,6 +1896,8 @@ fn account_view(store: &Store, id: &str, now: i64) -> anyhow::Result<AccountView
         id: id.to_string(),
         email: None,
         credits: 0,
+        created_at: None,
+        blocked: false,
     });
 
     // NOTE: one slot per service (watch), carrying its activation state,
@@ -1798,7 +1988,12 @@ impl FromRequestParts<AppState> for Caller {
             return Ok(Caller::Admin);
         }
         match state.store.resolve_capability(&token) {
-            Ok(Some(account_id)) => Ok(Caller::Account(account_id)),
+            // NOTE: a blacklisted account is inert (§ auth) — its link no
+            // longer authenticates any route.
+            Ok(Some(account_id)) => match state.store.is_blocked(&account_id) {
+                Ok(false) => Ok(Caller::Account(account_id)),
+                _ => Err(forbidden("account is blocked")),
+            },
             _ => Err(unauthorized()),
         }
     }
@@ -1823,9 +2018,61 @@ impl FromRequestParts<AppState> for CapabilityAccount {
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Response> {
         let token = bearer(&parts.headers).ok_or_else(unauthorized)?;
         match state.store.resolve_capability(&token) {
-            Ok(Some(account_id)) => Ok(CapabilityAccount(account_id)),
+            Ok(Some(account_id)) => match state.store.is_blocked(&account_id) {
+                Ok(false) => Ok(CapabilityAccount(account_id)),
+                _ => Err(forbidden("account is blocked")),
+            },
             _ => Err(unauthorized()),
         }
+    }
+}
+
+/// Authorization for the loopback admin console (§ auth). An extractor
+/// used ONLY by [`admin_router`]'s routes, which are never mounted on the
+/// public listener — so reaching it at all already implies the request
+/// arrived on the loopback admin listener (network position, the primary
+/// factor). On top of that it requires an identity: either a
+/// capability-link session whose account email is in `[admin] emails`
+/// (the everyday, attributable path) or the `api.admin_token`
+/// (break-glass, independent of the magic-link/session chain). Neither
+/// alone, on the public listener, can reach an admin route.
+struct AdminCaller {
+    /// Who acted, for the audit log: a whitelisted email or `admin-token`.
+    identity: String,
+}
+
+impl FromRequestParts<AppState> for AdminCaller {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Response> {
+        // NOTE: DEV ONLY — an open console for local `npm run dev` (see
+        // `[admin] dev_allow_insecure`). `main::serve` only enables this in
+        // a debug build, so the production release binary never takes this
+        // branch and always demands a real admin identity below.
+        if state.admin_dev_open {
+            return Ok(AdminCaller {
+                identity: "dev-insecure".to_string(),
+            });
+        }
+        let token = bearer(&parts.headers).ok_or_else(unauthorized)?;
+        // NOTE: break-glass token wins; digest compare leaks nothing.
+        if let Some(admin) = &state.admin_token
+            && token_matches(&token, admin)
+        {
+            return Ok(AdminCaller {
+                identity: "admin-token".to_string(),
+            });
+        }
+        // Whitelisted-email session: resolve the link, then the account's
+        // email, then check membership in the admin whitelist.
+        if let Ok(Some(account_id)) = state.store.resolve_capability(&token)
+            && let Ok(Some(account)) = state.store.get_account(&account_id)
+            && let Some(email) = account.email
+            && state.admin_emails.contains(&email)
+        {
+            return Ok(AdminCaller { identity: email });
+        }
+        Err(forbidden("admin access required"))
     }
 }
 
@@ -1959,8 +2206,8 @@ async fn auth(
     let login = request.login.clone();
     let protocol = request.protocol.clone();
     let membership_host = host;
-    let result =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<(String, &'static str, String)> {
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Option<(String, &'static str, String)>> {
             let mailbox_key = metering::mailbox_key(&login, &membership_host);
             let expires = Some(now_secs() + CAPABILITY_TTL.as_secs() as i64);
 
@@ -1974,9 +2221,25 @@ async fn auth(
                     .map(|id| (id, token.clone())),
                 None => None,
             };
+            let recovered = match &joined {
+                Some(_) => None,
+                None => store.account_of_mailbox(&mailbox_key)?,
+            };
+            // NOTE: a blacklisted account cannot join, recover, or mint a
+            // session here; refuse before issuing anything (§ auth). A
+            // freshly created account cannot be blocked.
+            let existing_id = joined
+                .as_ref()
+                .map(|(id, _)| id.clone())
+                .or_else(|| recovered.clone());
+            if let Some(id) = &existing_id
+                && store.is_blocked(id)?
+            {
+                return Ok(None);
+            }
             let (account_id, action, link) = match joined {
                 Some((id, token)) => (id, "joined", token),
-                None => match store.account_of_mailbox(&mailbox_key)? {
+                None => match recovered {
                     Some(id) => {
                         let link = random_secret();
                         store.issue_capability(&id, &link, expires)?;
@@ -2005,12 +2268,13 @@ async fn auth(
             // NOTE: no welcome credit here; the free head start is a
             // per-service trial granted at create_watch, so this endpoint
             // can't be farmed for spendable credits.
-            Ok((account_id, action, link))
-        })
-        .await;
+            Ok(Some((account_id, action, link)))
+        },
+    )
+    .await;
 
     match result {
-        Ok(Ok((account_id, action, link))) => {
+        Ok(Ok(Some((account_id, action, link)))) => {
             info!(account = %account_id, action, protocol = %request.protocol, "auth");
             Json(json!({
                 "account_id": account_id,
@@ -2023,6 +2287,7 @@ async fn auth(
             }))
             .into_response()
         }
+        Ok(Ok(None)) => forbidden("account is blocked"),
         _ => AppError(anyhow::anyhow!("auth failed")).into_response(),
     }
 }
@@ -2106,6 +2371,11 @@ fn verify_magic(store: &Store, token: &str) -> anyhow::Result<Option<(String, St
     let Some(email) = store.take_magic_link(token, MAGIC_LINK_TTL)? else {
         return Ok(None);
     };
+    // NOTE: a blacklisted account cannot mint a session (§ auth); refuse
+    // as if the link were invalid so the console reveals nothing.
+    if store.email_is_blocked(&email)? {
+        return Ok(None);
+    }
     let account_id = match store.account_by_email(&email)? {
         Some(id) => id,
         None => {
@@ -2541,4 +2811,37 @@ fn default_limit() -> u32 {
 
 fn default_packs() -> i64 {
     1
+}
+
+#[cfg(test)]
+mod watch_view_tests {
+    use super::WatchView;
+
+    fn sample(watching_until: Option<i64>) -> WatchView {
+        WatchView {
+            id: "w1".into(),
+            source_kind: "imap".into(),
+            imap_host: "imap.example.com".into(),
+            imap_port: 993,
+            login: "u@example.com".into(),
+            provider: "example.com".into(),
+            mailbox: "INBOX".into(),
+            notify_url: "https://example.com/hook".into(),
+            active: true,
+            watching_until,
+            carddav_url: None,
+        }
+    }
+
+    #[test]
+    fn watching_until_is_serialized_when_set() {
+        let json = serde_json::to_value(sample(Some(1_784_890_000))).unwrap();
+        assert_eq!(json["watching_until"], 1_784_890_000);
+    }
+
+    #[test]
+    fn watching_until_is_omitted_when_none() {
+        let json = serde_json::to_value(sample(None)).unwrap();
+        assert!(json.get("watching_until").is_none());
+    }
 }

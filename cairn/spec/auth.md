@@ -15,7 +15,7 @@ Carillon SHALL persist accounts and watches in the store, never in configuration
 Every route that touches watches, deliveries, accounts, or the live stream SHALL require a bearer token on `Authorization: Bearer <token>` and SHALL scope the request to the caller. This holds in every front, including self-host; there is no unauthenticated data access.
 
 ### Requirement: The Caller extractor resolves the bearer
-A `Caller` extractor SHALL resolve the presented bearer token to exactly one of two identities: a capability-link account, scoped to its own watches, deliveries, events, and pool; or the optional unscoped admin token `api.admin_token`, which grants fleet-wide access for ops and headless use. When `api.admin_token` is unset (the default), no unscoped access exists at all.
+A `Caller` extractor SHALL resolve the presented bearer token to exactly one of two identities: a capability-link account, scoped to its own watches, deliveries, events, and pool; or the optional unscoped admin token `api.admin_token`, which grants fleet-wide access for ops and headless use. When `api.admin_token` is unset (the default), no unscoped access exists at all. The `api.admin_token` additionally authorizes the loopback admin console (see the `AdminCaller` requirement) as a break-glass identity; its powers on the public listener are unchanged by the admin console.
 
 #### Scenario: Bearer matches a capability link
 - **GIVEN** a request carrying a valid, unexpired, un-revoked capability link
@@ -54,3 +54,63 @@ Carillon SHALL support minting, rotating, and expiring a capability link server-
 - **GIVEN** a capability link that has been signed out
 - **WHEN** a later request presents it
 - **THEN** the `Caller` extractor rejects it and no account scope is granted
+
+### Requirement: Admin console is served on a loopback-only listener
+Carillon SHALL expose administrative routes only on a second listener bound to a loopback address (`[admin] listen`, default `127.0.0.1:3001`), sharing the process `AppState` with the public listener. The loopback listener SHALL serve the FULL application (every normal route) PLUS the admin routes, so an operator who tunnels in can sign in with their whitelisted email ON THAT ORIGIN and then reach `/admin`. The public listener SHALL NOT mount any admin route, so an off-tunnel request to an admin path receives `404 Not Found` (the route does not exist there), not `403`. The sole intended access path is host-level: an SSH tunnel or SOCKS proxy to the loopback listener; the public reverse proxy SHALL front only the public listener. This transport boundary is the primary control — an application-layer auth defect alone cannot reach an admin verb.
+
+#### Scenario: Admin route reached on the public listener
+- **GIVEN** a request to an admin path arriving on the public listener
+- **WHEN** the router resolves it
+- **THEN** it is `404`, because the admin routes are not mounted on the public router
+
+#### Scenario: Admin route reached over the tunnel
+- **GIVEN** an operator with an `ssh -L` tunnel (or SOCKS proxy) to the loopback listener
+- **WHEN** they request an admin route with a valid admin identity
+- **THEN** the admin router serves it
+
+### Requirement: AdminCaller requires network position AND identity
+Every admin route SHALL be gated by an `AdminCaller` extractor that authorizes a request only when it (a) arrived on the loopback admin listener AND (b) carries either a capability-link session whose account email is in `[admin] emails`, or the configured `api.admin_token`. Neither identity alone, presented on the public listener, SHALL reach any admin verb. A missing bearer is rejected `401`; a present-but-unauthorized bearer is rejected `403`.
+
+#### Scenario: Whitelisted email over the tunnel
+- **GIVEN** a capability session whose account email is in `[admin] emails`, presented on the admin listener
+- **WHEN** `AdminCaller` resolves it
+- **THEN** the request is authorized
+
+#### Scenario: Admin token as break-glass
+- **GIVEN** `api.admin_token` is set and presented on the admin listener
+- **WHEN** `AdminCaller` resolves it
+- **THEN** the request is authorized even if the magic-link / session chain is unavailable
+
+#### Scenario: Non-whitelisted email
+- **GIVEN** a valid capability session whose account email is NOT in `[admin] emails`
+- **WHEN** `AdminCaller` resolves it
+- **THEN** the request is rejected `403`
+
+### Requirement: Admin console manages users, credits, and blacklist
+The admin console SHALL provide, on the admin router only: listing accounts (id, email, credit balance, blocked flag, creation time, and watch count) and new-signup counts over a window; listing one account's individual watches (lazy-loaded per account); viewing per-account and fleet-aggregate credit balances; manually adjusting an account's credit balance up or down (a downward adjustment beyond the balance is refused `409`); and blocking or unblocking an account (`404` when the account is unknown).
+
+### Requirement: A blocked account is inert
+Carillon SHALL persist a per-account `blocked` flag. A blocked account SHALL be refused at authentication and SHALL NOT mint or refresh a capability session or create watches, so blacklisting an abusive account takes effect immediately across every front. An already-issued capability link SHALL stop authenticating once its account is blocked (the `Caller` and capability extractors reject a blocked account `403`).
+
+#### Scenario: Blocked account attempts to authenticate
+- **GIVEN** an account whose `blocked` flag is set
+- **WHEN** it attempts `POST /auth` or a magic-link sign-in
+- **THEN** the request is refused and no session is issued
+
+#### Scenario: Blocked account reuses a live link
+- **GIVEN** an account blocked after its capability link was issued
+- **WHEN** a later request presents that link
+- **THEN** the extractor rejects it `403` and no account scope is granted
+
+### Requirement: Dev-only open admin console is compiled out of release
+Carillon MAY offer a development convenience (`[admin] dev_allow_insecure`) that skips admin authentication and additionally mounts the admin routes on the public listener, so a local `npm run dev` frontend can reach the console at its normal API base without a token or sign-in. This bypass SHALL be effective ONLY in a debug build; a release build (the production binary) SHALL compile it out entirely and SHALL ignore the flag with a warning, so the production console always demands a real admin identity. When the bypass is effective, Carillon SHALL log a prominent startup warning. This exists because a debug-build gate is a compile-time guarantee, not merely a config default, so the footgun (behind a reverse proxy every request looks local) cannot reach production.
+
+#### Scenario: dev_allow_insecure in a debug build
+- **GIVEN** a debug build (`cargo run`) with `[admin] dev_allow_insecure = true`
+- **WHEN** any request reaches an admin route on either listener
+- **THEN** it is authorized with no credential, and a startup warning was logged
+
+#### Scenario: dev_allow_insecure in a release build
+- **GIVEN** a release build with `[admin] dev_allow_insecure = true`
+- **WHEN** an admin route is requested on the public listener without an admin identity
+- **THEN** the public listener has no admin route (`404`) and the admin listener still requires a real admin identity, the flag having been compiled out

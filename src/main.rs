@@ -47,7 +47,7 @@ use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_rustls::TlsConnector;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::api::AppState;
@@ -229,6 +229,38 @@ async fn serve(config: Config) -> Result<()> {
         }
     };
 
+    // NOTE: the admin console flips off the same shutdown flag as the
+    // public API; clone the receiver before it moves into `AppState`.
+    let admin_shutdown = shutdown_rx.clone();
+    // NOTE: match how emails are stored (lowercased at magic-link
+    // request), so the whitelist compares apples to apples.
+    let admin_emails: std::collections::HashSet<String> = config
+        .admin
+        .emails
+        .iter()
+        .map(|email| email.trim().to_ascii_lowercase())
+        .collect();
+
+    // NOTE: DEV-ONLY open admin console. Effective ONLY in a debug build
+    // (`cargo run`) — a release build (the production binary) compiles the
+    // bypass out and always demands a real admin identity. When effective,
+    // the admin console needs no credential and is also mounted on the
+    // public listener so a `npm run dev` frontend can reach it.
+    let admin_dev_open = cfg!(debug_assertions) && config.admin.dev_allow_insecure;
+    if config.admin.dev_allow_insecure && !cfg!(debug_assertions) {
+        warn!(
+            "[admin] dev_allow_insecure is set but ignored: this is a release build \
+             and the insecure admin bypass is compiled out"
+        );
+    }
+    if admin_dev_open {
+        warn!(
+            "[admin] dev_allow_insecure is ON (debug build): the admin console is \
+             UNAUTHENTICATED and also served on the public listener. Local dev only — \
+             never run this build in production."
+        );
+    }
+
     let state = AppState {
         store: store.clone(),
         crypto: crypto.clone(),
@@ -246,6 +278,8 @@ async fn serve(config: Config) -> Result<()> {
         max_watches: config.server.max_watches_per_account.max(1),
         carddav_poll_secs: config.server.carddav_poll_interval_secs,
         admin_token: config.api.admin_token.clone(),
+        admin_emails: Arc::new(admin_emails),
+        admin_dev_open,
         public_url,
         dashboard_origin,
         oauth_clients,
@@ -255,11 +289,45 @@ async fn serve(config: Config) -> Result<()> {
         .with_context(|| format!("Cannot bind {}", config.api.listen))?;
     info!(listen = %config.api.listen, "control API listening");
 
+    // NOTE: the admin console is a SECOND listener on a loopback address.
+    // It serves the FULL app (every normal route) PLUS the admin routes,
+    // so an operator who tunnels in can sign in with their whitelisted
+    // email ON THIS ORIGIN and then reach `/admin`. The admin routes are
+    // mounted ONLY here (and, in a dev build, on the public listener);
+    // the public listener never learns them, so they are unreachable from
+    // the public internet — an SSH tunnel / SOCKS proxy is the only way in
+    // (§ auth).
+    let admin_listener = TcpListener::bind(&config.admin.listen)
+        .await
+        .with_context(|| format!("Cannot bind admin console {}", config.admin.listen))?;
+    info!(listen = %config.admin.listen, "admin console listening (loopback)");
+    let admin_service = api::router(
+        state.clone(),
+        config.api.ui_dir.clone(),
+        // NOTE: same-origin on the loopback listener; no CORS. `true`
+        // always mounts the admin routes here.
+        None,
+        true,
+    )
+    .into_make_service_with_connect_info::<SocketAddr>();
+    let admin_server = tokio::spawn(async move {
+        axum::serve(admin_listener, admin_service)
+            .with_graceful_shutdown(async move {
+                // End when the public server flips the shutdown flag on ctrl_c.
+                let mut admin_shutdown = admin_shutdown;
+                let _ = admin_shutdown.wait_for(|flag| *flag).await;
+            })
+            .await
+    });
+
     let shutdown_commands = command_tx.clone();
     let service = api::router(
         state,
         config.api.ui_dir.clone(),
         config.api.cors_allow_origin.clone(),
+        // NOTE: admin routes reach the PUBLIC listener only in a dev build
+        // (the insecure-localhost convenience); never in release.
+        admin_dev_open,
     )
     .into_make_service_with_connect_info::<SocketAddr>();
     axum::serve(listener, service)
@@ -273,6 +341,10 @@ async fn serve(config: Config) -> Result<()> {
         })
         .await
         .context("Control API failed")?;
+
+    // NOTE: the ctrl_c flag flipped above also ends the admin server;
+    // wait for it to finish its graceful shutdown too.
+    let _ = admin_server.await;
 
     Ok(())
 }

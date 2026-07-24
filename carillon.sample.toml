@@ -58,6 +58,28 @@ listen = "127.0.0.1:3000"
 # origin is the postMessage target). Defaults to public_url.
 # dashboard_url = "https://app.carillon.example.org"
 
+# Localhost-only admin console. Served on a SECOND listener, distinct from
+# the public control API above, so its management verbs (credit-adjust,
+# blacklist) are UNREACHABLE from the public internet. Keep `listen` on a
+# loopback address and never front it with your reverse proxy: the only
+# intended access path is an SSH tunnel / SOCKS proxy to this address
+# (e.g. `ssh -L 3001:127.0.0.1:3001 host`, then browse http://127.0.0.1:3001/admin).
+[admin]
+# Loopback listen address of the admin console. Defaults to 127.0.0.1:3001.
+listen = "127.0.0.1:3001"
+# Emails allowed to use the console. A capability-link session whose
+# account email is in this list is an admin on the loopback listener
+# (attributable). The `api.admin_token` above also works here as a
+# break-glass identity. Empty = only the admin_token authorizes it.
+# emails = ["you@example.org"]
+# DEV ONLY. When true AND this is a debug build (`cargo run`), the admin
+# console skips authentication and is also served on the public API listener,
+# so a `npm run dev` frontend can reach it at its normal API base with no token
+# or sign-in. IGNORED by a release build (the production binary compiles the
+# bypass out). NEVER set this in production: behind a reverse proxy every
+# request looks local, so the console would be world-writable. Default false.
+# dev_allow_insecure = true
+
 # OAuth client overrides — your own registered apps instead of the built-in
 # Thunderbird public clients. Needed to use a hosted redirect URI (register
 # {public_url}/oauth/callback with the provider). Fastmail needs nothing here
