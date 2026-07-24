@@ -28,6 +28,9 @@ use url::Url;
 
 use crate::carddav::pump as carddav_pump;
 use crate::carddav::session::{CardDavAccount, CardDavAuth};
+use secrecy::SecretString;
+use secrecy::zeroize::Zeroizing;
+
 use crate::crypto::Crypto;
 use crate::event::ChangeEvent;
 use crate::imap::pump;
@@ -38,10 +41,13 @@ use crate::oauth;
 use crate::store::{Store, Watch};
 use crate::util::now_secs;
 
-/// How a watcher authenticates each time it connects. A password is
-/// constant; OAuth mints a fresh access token from the stored refresh
-/// token on every connect.
+/// How a watcher authenticates each time it connects. Both variants hold
+/// only ciphertext / a store reference: the password is the ENCRYPTED blob,
+/// decrypted just-in-time at each connect (never held as plaintext for the
+/// watch's lifetime); OAuth mints a fresh access token from the stored
+/// refresh token every connect (§ hardening, minimal-residency).
 enum Credential {
+    /// The age-encrypted password blob; decrypted per connect.
     Password(String),
     Oauth,
 }
@@ -214,10 +220,11 @@ impl Supervisor {
         // service when metered.
 
         // NOTE: an OAuth watch defers to the stored `oauth_credential`,
-        // minting a fresh access token per connect. A password is
-        // decrypted once from the watch itself (self-host / import) or,
-        // when the watch carries none, from the PIM account's stored
-        // password credential, so a re-auth is picked up on reconnect.
+        // minting a fresh access token per connect. A password watch carries
+        // the ENCRYPTED blob (from the watch itself for self-host/import, else
+        // the PIM account's stored password credential) and decrypts it
+        // just-in-time at each connect — never held as plaintext for the
+        // watch's lifetime (§ hardening, minimal-residency).
         let credential = if watch.auth_kind == "oauth" {
             Credential::Oauth
         } else {
@@ -229,7 +236,7 @@ impl Supervisor {
             } else {
                 watch.enc_password.clone()
             };
-            Credential::Password(self.crypto.decrypt(&enc)?)
+            Credential::Password(enc)
         };
 
         let id = watch.id.clone();
@@ -287,7 +294,7 @@ impl Supervisor {
                 host: watch.imap_host.clone(),
                 port: watch.imap_port,
                 login: watch.login.clone(),
-                auth: ImapAuth::Password(String::new()),
+                auth: ImapAuth::Password(SecretString::from(String::new())),
                 mailbox: watch.mailbox.clone(),
             };
             tokio::spawn(async move {
@@ -409,27 +416,28 @@ async fn watch_loop(ctx: WatchLoop) {
     let mut backoff = INITIAL_BACKOFF;
 
     while !shutdown.load(Ordering::SeqCst) {
-        // NOTE: a password is constant; OAuth mints a fresh access token
-        // from the stored refresh token. A refresh failure is transient,
-        // so surface it and back off like a connect failure.
-        account.auth = match &credential {
-            Credential::Password(password) => ImapAuth::Password(password.clone()),
-            Credential::Oauth => {
-                match resolve_oauth_access(&store, &crypto, &account_id, &account).await {
-                    Ok(token) => ImapAuth::OauthBearer(token),
-                    Err(err) => {
-                        warn!(watch = %id, error = %err, "oauth token refresh failed");
-                        let _ =
-                            live.send(status(WatchState::Error, Some(format!("oauth: {err:#}"))));
-                        if shutdown.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let _ = live.send(status(WatchState::Reconnecting, None));
-                        sleep(backoff + jitter(backoff)).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
+        // NOTE: resolve the credential fresh each connect — decrypt the
+        // password just-in-time (minimal residency) or mint a fresh OAuth
+        // access token. Either can fail transiently (bad key, refresh
+        // rejected); surface it and back off like a connect failure.
+        let auth = match &credential {
+            Credential::Password(enc) => crypto.decrypt_secret(enc).map(ImapAuth::Password),
+            Credential::Oauth => resolve_oauth_access(&store, &crypto, &account_id, &account)
+                .await
+                .map(ImapAuth::OauthBearer),
+        };
+        account.auth = match auth {
+            Ok(auth) => auth,
+            Err(err) => {
+                warn!(watch = %id, error = %err, "credential resolution failed");
+                let _ = live.send(status(WatchState::Error, Some(format!("auth: {err:#}"))));
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
                 }
+                let _ = live.send(status(WatchState::Reconnecting, None));
+                sleep(backoff + jitter(backoff)).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
             }
         };
 
@@ -586,34 +594,37 @@ async fn carddav_watch_loop(ctx: CardDavLoop) {
     let mut announced = false;
 
     while !shutdown.load(Ordering::SeqCst) {
-        // NOTE: a password is constant; OAuth mints a fresh bearer token
-        // keyed by the PIM identity (not the CardDAV host).
-        let auth = match &credential {
-            Credential::Password(password) => CardDavAuth::Password(password.clone()),
+        // NOTE: resolve the credential fresh each poll — decrypt the
+        // password just-in-time (minimal residency) or mint a fresh OAuth
+        // bearer keyed by the PIM identity (not the CardDAV host).
+        let resolved = match &credential {
+            Credential::Password(enc) => crypto.decrypt_secret(enc).map(CardDavAuth::Password),
             Credential::Oauth => {
                 let identity = ImapAccount {
                     host: imap_host.clone(),
                     port: imap_port,
                     login: login.clone(),
-                    auth: ImapAuth::Password(String::new()),
+                    auth: ImapAuth::Password(SecretString::from(String::new())),
                     mailbox: String::new(),
                 };
-                match resolve_oauth_access(&store, &crypto, &account_id, &identity).await {
-                    Ok(token) => CardDavAuth::Bearer(token),
-                    Err(err) => {
-                        warn!(watch = %id, error = %err, "carddav oauth token refresh failed");
-                        let _ =
-                            live.send(status(WatchState::Error, Some(format!("oauth: {err:#}"))));
-                        announced = false;
-                        if shutdown.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let _ = live.send(status(WatchState::Reconnecting, None));
-                        sleep(backoff + jitter(backoff)).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
+                resolve_oauth_access(&store, &crypto, &account_id, &identity)
+                    .await
+                    .map(CardDavAuth::Bearer)
+            }
+        };
+        let auth = match resolved {
+            Ok(auth) => auth,
+            Err(err) => {
+                warn!(watch = %id, error = %err, "credential resolution failed");
+                let _ = live.send(status(WatchState::Error, Some(format!("auth: {err:#}"))));
+                announced = false;
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
                 }
+                let _ = live.send(status(WatchState::Reconnecting, None));
+                sleep(backoff + jitter(backoff)).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
             }
         };
         let account = CardDavAccount {
@@ -697,7 +708,7 @@ pub(crate) async fn resolve_oauth_access(
     crypto: &Arc<Crypto>,
     account_id: &str,
     account: &ImapAccount,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<SecretString> {
     let mailbox_key = metering::mailbox_key(&account.login, &account.host);
 
     let cred = {
@@ -708,7 +719,9 @@ pub(crate) async fn resolve_oauth_access(
             .context("no OAuth credential for this mailbox")?
     };
 
-    let refresh_token = crypto.decrypt(&cred.enc_refresh_token)?;
+    // NOTE: the decrypted refresh token zeroizes on drop; it lives only for
+    // this refresh call, never past the function (§ hardening).
+    let refresh_token = Zeroizing::new(crypto.decrypt(&cred.enc_refresh_token)?);
     let client_secret = match &cred.enc_client_secret {
         Some(enc) => Some(crypto.decrypt(enc)?),
         None => None,
@@ -731,7 +744,7 @@ pub(crate) async fn resolve_oauth_access(
     // NOTE: persist a rotated refresh token so the next refresh uses the
     // current one.
     if let Some(new_refresh) = &tokens.refresh_token
-        && new_refresh != &refresh_token
+        && new_refresh.as_str() != refresh_token.as_str()
     {
         let enc = crypto.encrypt(new_refresh)?;
         let store = store.clone();
@@ -740,5 +753,7 @@ pub(crate) async fn resolve_oauth_access(
             .await??;
     }
 
-    Ok(tokens.access_token)
+    // NOTE: hand the access token back as a zeroizing secret so it never
+    // lingers as a bare String past the connect that uses it.
+    Ok(SecretString::from(tokens.access_token))
 }

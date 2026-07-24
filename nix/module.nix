@@ -191,6 +191,17 @@ in
         MemoryMax = cfg.memoryMax;
         TasksMax = 4096;
 
+        # Minimal-residency backstops (cairn/spec/hardening.md): a
+        # decrypted credential lives only transiently in RAM, so make sure an
+        # accidental capture can't spill it to disk.
+        # - No coredumps: a crash must not write process memory (with a live
+        #   plaintext credential mid-connect) to disk.
+        LimitCORE = "0";
+        # - Never swap this unit's pages out, so a decrypted secret cannot
+        #   land in swap (cgroup v2). Pairs with a swapless / encrypted-swap
+        #   host baseline.
+        MemorySwapMax = "0";
+
         # Sandbox.
         NoNewPrivileges = true;
         ProtectSystem = "strict";

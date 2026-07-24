@@ -33,6 +33,12 @@ The existing per-`(IP,login)` and per-IP rate limiters SHALL be retained, a **gl
 ### Requirement: Custody of the age key
 The age key (`server.age_key_file`) decrypts every stored credential and is the crown jewel: losing it bricks every watch, and leaking it plus a DB dump is full credential compromise. It SHALL be generated offline, stored `0600` owned by the service user, and backed up out-of-band — never in the same bucket as the DB. It SHALL be delivered via systemd `LoadCredential=` / `systemd-creds` or a secrets manager in preference to a plaintext file on disk. See [[architecture]] on credential custody as the adoption ground.
 
+### Requirement: Minimal decrypted-credential residency
+A decrypted credential SHALL exist in process memory only transiently, around the connection that needs it. The watcher SHALL hold the credential in encrypted form, decrypt it just-in-time at each connect into a zeroize-on-drop secret type (`secrecy::SecretString`), expose it only for the authentication call, and drop it immediately after — re-decrypting on reconnect, symmetric with the OAuth mint-per-connect path. No long-lived plaintext credential SHALL persist for the lifetime of a watch. The credential-bearing auth types SHALL NOT derive `Clone` and SHALL redact their secret in `Debug`, so no decrypted secret is ever cloned needlessly or logged. See [[architecture]].
+
+### Requirement: Suppress accidental secret capture
+The service SHALL disable coredumps (`LimitCORE=0`) and keep decrypted secrets out of swap (`MemorySwapMax=0` on the unit, paired with a swapless / encrypted-swap host baseline), so an accidental capture — core dump, swap, memory scrape — does not yield a plaintext credential. This complements at-rest key custody: it addresses the plaintext in RAM, not the key on disk.
+
 ### Requirement: Custody of the admin, billing, and OAuth secrets
 The `api.admin_token` is an unscoped god token and SHALL be a long random value, scoped to ops, and required in production (fail closed) rather than optional. The Stripe secret key, the Stripe webhook signing secret, and the OAuth client secrets SHALL be handled the same way — never in the repo and never in plaintext env in the unit file, delivered via `LoadCredential=`. See [[auth]] for the identity surface these protect.
 

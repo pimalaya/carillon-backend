@@ -25,6 +25,7 @@ use io_webdav::rfc6352::addressbook::home_set::AddressbookHomeSet;
 use io_webdav::rfc6352::addressbook::list::ListAddressbooks;
 use io_webdav::rfc6578::sync_collection::{SyncCollection, SyncCollectionError, SyncDelta};
 use rustls::pki_types::ServerName;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -48,16 +49,18 @@ const USER_AGENT: &str = "carillon";
 /// How to authenticate a CardDAV request: a password (HTTP Basic, RFC
 /// 7617) or an OAuth 2.0 bearer token (RFC 6750), mirroring
 /// [`crate::imap::session::ImapAuth`]. Resolved just before each poll.
-#[derive(Clone, Debug)]
+// NOTE: no `Clone`, and the secret variants hold `SecretString` (zeroize on
+// drop, redacted `Debug`), mirroring `ImapAuth` (§ hardening, minimal-residency).
+#[derive(Debug)]
 pub enum CardDavAuth {
     /// Cleartext password / app password, sent as HTTP Basic.
-    Password(String),
+    Password(SecretString),
     /// A short-lived OAuth 2.0 bearer access token.
-    Bearer(String),
+    Bearer(SecretString),
 }
 
 /// Connection parameters for one CardDAV addressbook watch.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CardDavAccount {
     /// Full collection URL, e.g.
     /// `https://carddav.host/dav/addressbooks/user/x/Default/`.
@@ -71,10 +74,13 @@ pub struct CardDavAccount {
 impl CardDavAccount {
     fn webdav_auth(&self) -> WebdavAuth {
         match &self.auth {
-            CardDavAuth::Password(password) => {
-                WebdavAuth::Basic(HttpAuthBasic::new(self.login.clone(), password.clone()))
+            CardDavAuth::Password(password) => WebdavAuth::Basic(HttpAuthBasic::new(
+                self.login.clone(),
+                password.expose_secret().to_string(),
+            )),
+            CardDavAuth::Bearer(token) => {
+                WebdavAuth::Bearer(HttpAuthBearer::new(token.expose_secret().to_string()))
             }
-            CardDavAuth::Bearer(token) => WebdavAuth::Bearer(HttpAuthBearer::new(token.clone())),
         }
     }
 

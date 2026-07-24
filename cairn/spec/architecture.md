@@ -34,7 +34,7 @@ Webhook delivery SHALL be decoupled from the watcher hot path: outbound POSTs ar
 Persistent state (watches, webhooks/notify config, delivery log, and the SaaS account/billing state) SHALL live in a local SQLite database accessed via `sqlx` in WAL mode. Postgres is adopted only when SQLite is outgrown.
 
 ### Requirement: Credentials encrypted at rest
-Mailbox credentials SHALL be encrypted at rest using the `age` crate with a key held in the box's secrets file (KMS deferred). See [[overview]] on credential custody as the adoption ground.
+Mailbox credentials SHALL be encrypted at rest using the `age` crate with a key held in the box's secrets file (external wrapping deferred to the custody-boundary work). Beyond at-rest encryption, the decrypted plaintext SHALL be minimised in memory: decrypted just-in-time per connect, held in a zeroizing secret type, and dropped after the authentication call rather than held for the watch's lifetime (see [[hardening]]). See [[overview]] on credential custody as the adoption ground.
 
 ### Requirement: Axum control API
 The control surface SHALL be an axum HTTP server exposing REST+JSON for control and SSE for the live delivery-log / connection-status stream, running in the same process as the watchers at MVP. It SHALL be splittable into a separate service later purely for fault isolation and independent deploy.

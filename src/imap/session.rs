@@ -18,6 +18,7 @@ use io_imap::rfc7628::auth_oauthbearer::{ImapAuthOauthbearer, ImapAuthOauthbeare
 use io_imap::types::flag::FlagNameAttribute;
 use io_imap::types::mailbox::{ListMailbox, Mailbox};
 use io_imap::types::response::Capability;
+use secrecy::{ExposeSecret, SecretString};
 use rustls::pki_types::ServerName;
 use serde::Serialize;
 use socket2::{SockRef, TcpKeepalive};
@@ -44,16 +45,19 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// 2.0 access token (SASL `OAUTHBEARER`). Resolved just before
 /// connecting; for OAuth the access token is minted fresh from the
 /// stored refresh token.
-#[derive(Clone, Debug)]
+// NOTE: no `Clone`, and the secret variants hold `SecretString` (zeroize
+// on drop, redacted `Debug`), so an auth value never lingers in memory or
+// leaks into a log line (§ hardening, minimal-residency).
+#[derive(Debug)]
 pub enum ImapAuth {
     /// Cleartext password / app password.
-    Password(String),
+    Password(SecretString),
     /// A short-lived OAuth 2.0 bearer access token.
-    OauthBearer(String),
+    OauthBearer(SecretString),
 }
 
 /// Connection parameters for one watch.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ImapAccount {
     /// IMAP server host.
     pub host: String,
@@ -138,7 +142,7 @@ async fn authenticate(
                 ensure_capabilities: true,
                 auto_id: None,
             };
-            let login = ImapLogin::new(&account.login, password, login_opts)
+            let login = ImapLogin::new(&account.login, password.expose_secret(), login_opts)
                 .context("Invalid IMAP credentials")?;
             pump::run(stream, fragmentizer, login)
                 .await?
@@ -150,8 +154,13 @@ async fn authenticate(
                 ensure_capabilities: true,
                 auto_id: None,
             };
-            let auth =
-                ImapAuthOauthbearer::new(&account.login, &account.host, account.port, token, opts);
+            let auth = ImapAuthOauthbearer::new(
+                &account.login,
+                &account.host,
+                account.port,
+                token.expose_secret(),
+                opts,
+            );
             pump::run(stream, fragmentizer, auth)
                 .await?
                 .context("IMAP OAUTHBEARER authentication failed")

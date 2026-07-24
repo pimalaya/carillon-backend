@@ -23,6 +23,7 @@ use axum::{Json, Router};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_rustls::TlsConnector;
@@ -677,7 +678,7 @@ async fn oauth_callback(
         let account = CardDavAccount {
             url: oauth_session.carddav_url.clone().unwrap_or_default(),
             login: oauth_session.login.clone(),
-            auth: CardDavAuth::Bearer(tokens.access_token.clone()),
+            auth: CardDavAuth::Bearer(SecretString::from(tokens.access_token.clone())),
         };
         let probe = crate::carddav::session::verify_auth(&state.connector, &account).await;
         if !probe.authenticated {
@@ -695,7 +696,7 @@ async fn oauth_callback(
             host: oauth_session.imap_host.clone(),
             port: oauth_session.imap_port,
             login: oauth_session.login.clone(),
-            auth: ImapAuth::OauthBearer(tokens.access_token.clone()),
+            auth: ImapAuth::OauthBearer(SecretString::from(tokens.access_token.clone())),
             mailbox: oauth_session.mailbox.clone(),
         };
         let probe = session::probe(&state.connector, &probe_account).await;
@@ -907,7 +908,7 @@ async fn test_connect(
             return bad_request("carddav_url is required for a CardDAV test");
         };
         let auth = if !request.password.is_empty() {
-            CardDavAuth::Password(request.password.clone())
+            CardDavAuth::Password(SecretString::from(request.password.clone()))
         } else {
             let Some(token) = bearer(&headers) else {
                 return unauthorized();
@@ -922,7 +923,7 @@ async fn test_connect(
                 .get_password_credential(&account_id, &mailbox_key)
             {
                 Ok(Some(enc)) => match state.crypto.decrypt(&enc) {
-                    Ok(password) => CardDavAuth::Password(password),
+                    Ok(password) => CardDavAuth::Password(SecretString::from(password)),
                     Err(err) => return AppError(err).into_response(),
                 },
                 Ok(None) => return bad_request("no stored credential for this PIM account"),
@@ -959,7 +960,7 @@ async fn test_connect(
         host: request.imap_host,
         port: request.imap_port,
         login: request.login,
-        auth: ImapAuth::Password(request.password),
+        auth: ImapAuth::Password(SecretString::from(request.password)),
         mailbox: request.mailbox,
     };
 
@@ -1028,7 +1029,7 @@ async fn list_mailboxes(
         host: request.imap_host,
         port: request.imap_port,
         login: request.login,
-        auth: ImapAuth::Password(request.password.clone()),
+        auth: ImapAuth::Password(SecretString::from(request.password.clone())),
         mailbox: default_mailbox(),
     };
 
@@ -1050,7 +1051,7 @@ async fn list_mailboxes(
             .get_password_credential(&account_id, &mailbox_key)
         {
             Ok(Some(enc)) => match state.crypto.decrypt(&enc) {
-                Ok(password) => account.auth = ImapAuth::Password(password),
+                Ok(password) => account.auth = ImapAuth::Password(SecretString::from(password)),
                 Err(err) => return AppError(err).into_response(),
             },
             Ok(None) => match supervisor::resolve_oauth_access(
@@ -1170,7 +1171,7 @@ async fn list_addressbooks(
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_default();
     let auth = if !request.password.is_empty() {
-        CardDavAuth::Password(request.password.clone())
+        CardDavAuth::Password(SecretString::from(request.password.clone()))
     } else {
         let Some(token) = bearer(&headers) else {
             return unauthorized();
@@ -1185,7 +1186,7 @@ async fn list_addressbooks(
             .get_password_credential(&account_id, &mailbox_key)
         {
             Ok(Some(enc)) => match state.crypto.decrypt(&enc) {
-                Ok(password) => CardDavAuth::Password(password),
+                Ok(password) => CardDavAuth::Password(SecretString::from(password)),
                 Err(err) => return AppError(err).into_response(),
             },
             Ok(None) => {
@@ -1196,7 +1197,7 @@ async fn list_addressbooks(
                     host: host.clone(),
                     port: 443,
                     login: request.login.clone(),
-                    auth: ImapAuth::Password(String::new()),
+                    auth: ImapAuth::Password(SecretString::from(String::new())),
                     mailbox: String::new(),
                 };
                 match supervisor::resolve_oauth_access(
@@ -2151,7 +2152,7 @@ async fn auth(
         let account = CardDavAccount {
             url: url.clone(),
             login: request.login.clone(),
-            auth: CardDavAuth::Password(request.password.clone()),
+            auth: CardDavAuth::Password(SecretString::from(request.password.clone())),
         };
         let probe = crate::carddav::session::verify_auth(&state.connector, &account).await;
         let host = Url::parse(&url)
@@ -2173,7 +2174,7 @@ async fn auth(
             host: request.imap_host.clone(),
             port: request.imap_port,
             login: request.login.clone(),
-            auth: ImapAuth::Password(request.password.clone()),
+            auth: ImapAuth::Password(SecretString::from(request.password.clone())),
             mailbox: request.mailbox.clone(),
         };
         let probe = session::probe(&state.connector, &account).await;
