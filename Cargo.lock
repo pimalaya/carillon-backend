@@ -296,13 +296,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "carillon-backend"
+name = "carillon-core"
+version = "0.0.0"
+dependencies = [
+ "io-http",
+ "io-imap",
+ "io-webdav",
+ "secrecy",
+ "serde",
+ "thiserror 2.0.19",
+ "url",
+]
+
+[[package]]
+name = "carillon-server"
 version = "0.1.0"
 dependencies = [
  "age",
  "anyhow",
  "axum",
  "base64",
+ "carillon-core",
  "hex",
  "hmac 0.13.0",
  "io-http",

@@ -6,7 +6,7 @@ landed: 2026-07-23
 
 # Adopt Cairn and migrate the docs/ folder
 
-Adopted the Cairn convention for carillon-backend. Created the `cairn/` root, added the activation surface (`AGENTS.md` with `CLAUDE.md`, Cursor and Copilot pointers) and the `verify.sh` Stop hook vendored from pimalaya/cairn, and removed the old `docs/` folder after migrating its content.
+Adopted the Cairn convention for carillon-server. Created the `cairn/` root, added the activation surface (`AGENTS.md` with `CLAUDE.md`, Cursor and Copilot pointers) and the `verify.sh` Stop hook vendored from pimalaya/cairn, and removed the old `docs/` folder after migrating its content.
 
 Moved `openapi.yaml` from `docs/` to the repository root — it is a served contract artifact compiled into the binary via `include_str!`, not prose — and repointed the `include_str!` path in `src/api.rs` plus every reference in the README, CONTRIBUTING, the frontend, and the deploy repo. `cargo check` green.
 

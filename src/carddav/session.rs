@@ -19,11 +19,10 @@ use io_webdav::rfc4918::coroutine::WebdavRedirectYield;
 use io_webdav::rfc4918::follow_redirects::FollowRedirectsError;
 use io_webdav::rfc4918::propfind::Propfind;
 use io_webdav::rfc4918::send::SendError;
-use io_webdav::rfc4918::{GETCTAG, GETETAG, SYNC_TOKEN, WebdavAuth};
+use io_webdav::rfc4918::{GETCTAG, SYNC_TOKEN, WebdavAuth};
 use io_webdav::rfc5397::current_user_principal::CurrentUserPrincipal;
 use io_webdav::rfc6352::addressbook::home_set::AddressbookHomeSet;
 use io_webdav::rfc6352::addressbook::list::ListAddressbooks;
-use io_webdav::rfc6578::sync_collection::{SyncCollection, SyncCollectionError, SyncDelta};
 use rustls::pki_types::ServerName;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -87,7 +86,7 @@ impl CardDavAccount {
     /// Splits the collection URL into `(host, port, base_url, path)`: the
     /// origin to open a TLS stream to, plus the base and absolute path
     /// io-webdav resolves the request target against.
-    fn parts(&self) -> Result<(String, u16, Url, String)> {
+    pub(crate) fn parts(&self) -> Result<(String, u16, Url, String)> {
         let full =
             Url::parse(&self.url).with_context(|| format!("invalid CardDAV URL: {}", self.url))?;
         if full.scheme() != "https" {
@@ -103,25 +102,6 @@ impl CardDavAccount {
         let path = full.path().to_string();
         Ok((host, port, base_url, path))
     }
-}
-
-/// The content-free resource id of a member href: its last path segment
-/// (the vCard resource name), the CardDAV analogue of an IMAP UID.
-pub fn resource_id(href: &str) -> String {
-    href.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(href)
-        .to_string()
-}
-
-/// Why a `sync-collection` poll failed, keeping the "token rejected"
-/// case distinct so the poller can re-baseline instead of erroring.
-pub enum SyncPollError {
-    /// The server rejected the sync token; a fresh baseline is needed.
-    InvalidToken,
-    /// A transport / protocol failure, surfaced as a watch error.
-    Other(anyhow::Error),
 }
 
 /// The structured outcome of probing a CardDAV collection, the read-only
@@ -149,7 +129,11 @@ impl CardDavProbe {
 /// Opens a TLS stream to a CardDAV host, SSRF-guarded like the IMAP path:
 /// resolve + check first, then connect to that exact address (SNI and
 /// certificate verification still use the hostname).
-async fn open(connector: &TlsConnector, host: &str, port: u16) -> Result<TlsStream<TcpStream>> {
+pub(crate) async fn open(
+    connector: &TlsConnector,
+    host: &str,
+    port: u16,
+) -> Result<TlsStream<TcpStream>> {
     let addr = guard::resolve_allowed(host, port)
         .await
         .with_context(|| format!("Cannot connect to {host}:{port}"))?;
@@ -256,31 +240,6 @@ pub async fn probe(connector: &TlsConnector, account: &CardDavAccount) -> CardDa
     }
 
     probe
-}
-
-/// Runs one `sync-collection` REPORT (RFC 6578) against the collection,
-/// asking only for etags. `since` is the checkpoint token (`None` for an
-/// initial enumeration). Returns the parsed delta, or a [`SyncPollError`]
-/// distinguishing a rejected token from a transport failure.
-pub async fn sync_changes(
-    connector: &TlsConnector,
-    account: &CardDavAccount,
-    since: Option<&str>,
-) -> Result<SyncDelta, SyncPollError> {
-    let (host, port, base_url, path) = account.parts().map_err(SyncPollError::Other)?;
-    let auth = account.webdav_auth();
-    let mut stream = open(connector, &host, port)
-        .await
-        .map_err(SyncPollError::Other)?;
-    let report = SyncCollection::new(&base_url, &auth, USER_AGENT, &path, since, &[GETETAG]);
-    match drive(&mut stream, report).await {
-        Ok(Ok(delta)) => Ok(delta),
-        Ok(Err(SyncCollectionError::InvalidSyncToken)) => Err(SyncPollError::InvalidToken),
-        Ok(Err(err)) => Err(SyncPollError::Other(anyhow::anyhow!(
-            "sync-collection failed: {err}"
-        ))),
-        Err(err) => Err(SyncPollError::Other(err)),
-    }
 }
 
 /// One addressbook collection discovered under an account's home-set, the

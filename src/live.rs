@@ -51,8 +51,8 @@ pub enum LiveEvent {
     /// A delivery attempt completed (success or final failure).
     Delivery {
         account: String,
-        event: &'static str,
-        uid: u32,
+        source: &'static str,
+        target: String,
         ok: bool,
         status: Option<u16>,
         attempts: u32,
@@ -127,16 +127,16 @@ impl LiveEvent {
     /// A delivery-outcome event stamped now.
     pub fn delivery(
         account: impl Into<String>,
-        event: &'static str,
-        uid: u32,
+        source: &'static str,
+        target: impl Into<String>,
         ok: bool,
         status: Option<u16>,
         attempts: u32,
     ) -> Self {
         LiveEvent::Delivery {
             account: account.into(),
-            event,
-            uid,
+            source,
+            target: target.into(),
             ok,
             status,
             attempts,

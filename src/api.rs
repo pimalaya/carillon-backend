@@ -21,9 +21,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rand::RngExt;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_rustls::TlsConnector;
@@ -126,7 +126,7 @@ pub struct AppState {
 }
 
 /// Builds the control API router. `ui_dir`, if set, is served as static
-/// files at the origin (self-host embedding a `carillon-frontend` build);
+/// files at the origin (self-host embedding a `carillon-admin` build);
 /// `cors_origin`, if set, enables cross-origin access for a CDN-served
 /// front.
 pub fn router(
@@ -359,7 +359,7 @@ async fn admin_set_blocked(
 /// Service metadata for the root path (self-host without a UI).
 async fn service_info() -> Json<serde_json::Value> {
     Json(json!({
-        "name": "carillon-backend",
+        "name": "carillon-server",
         "version": env!("CARGO_PKG_VERSION"),
         "openapi": "/openapi.yaml",
         "docs": "https://carillon.pimalaya.org",
@@ -1696,8 +1696,8 @@ struct DeliveryQuery {
 #[derive(Serialize)]
 struct DeliveryView {
     account: String,
-    event: String,
-    uid: u32,
+    source: String,
+    target: String,
     ok: bool,
     status: Option<u16>,
     error: Option<String>,
@@ -1737,8 +1737,8 @@ async fn list_deliveries(
         .into_iter()
         .map(|row| DeliveryView {
             account: row.account,
-            event: row.event,
-            uid: row.uid,
+            source: row.source,
+            target: row.target,
             ok: row.ok,
             status: row.status,
             error: row.error,

@@ -1,33 +1,46 @@
 //! The CardDAV poll pump.
 //!
-//! One `sync-collection` round: enumerate what changed since the last
-//! checkpoint token, fold each changed / removed member into a canonical
-//! [`ChangeEvent`], and hand back the next token to checkpoint. The
-//! reconnect / backoff / status orchestration lives in the
-//! [`supervisor`](crate::supervisor); this is the CardDAV analogue of
-//! [`crate::imap::pump::run_watch`].
+//! One `sync-collection` round driven over a fresh TLS connection. The
+//! sync-collection logic itself lives in carillon-core
+//! ([`CarillonCardDavPoll`]) — the same content-free poll a second frontend
+//! would share; this owns only the connection and folds a change into a
+//! [`ChangeEvent`]. The reconnect / backoff / interval orchestration lives
+//! in the [`supervisor`](crate::supervisor); this is the CardDAV analogue
+//! of [`crate::imap::pump::run_watch_core`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use carillon_core::backend::CarillonCardDavBackend;
+use carillon_core::carddav::{
+    CarillonCardDavChange, CarillonCardDavPoll, CarillonCardDavPollProgress,
+};
+use carillon_core::credential::CarillonCredential;
+use secrecy::{ExposeSecret, SecretString};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_rustls::TlsConnector;
 
-use crate::carddav::session::{self, CardDavAccount, SyncPollError};
-use crate::event::{ChangeEvent, ChangeKind};
+use crate::carddav::session::{self, CardDavAccount, CardDavAuth};
+use crate::event::ChangeEvent;
 
-/// Runs one poll of a CardDAV collection.
+/// Per-read scratch buffer. A `sync-collection` REPORT that only fetches
+/// etags stays small; io-http reassembles across reads.
+const READ_BUF: usize = 16 * 1024;
+
+/// Runs one poll of a CardDAV collection, driving carillon-core's I/O-free
+/// `CarillonCardDavPoll` over a fresh connection.
 ///
 /// `token` is the last checkpoint (`None` means never synced). A `None`
-/// token performs a baseline enumeration whose members are not emitted,
-/// so activating a service does not fire one event per existing contact,
-/// and only checkpoints the returned token. Every later poll emits the
-/// real delta.
+/// token performs a baseline enumeration whose change is not emitted, so
+/// activating a service does not fire on every existing contact, and only
+/// checkpoints the returned token. Every later poll emits one content-free
+/// ring per change.
 ///
-/// Returns the next token to persist (equal to `token` if nothing
-/// changed, or `None` if the server rejected the token and a fresh
-/// baseline is needed). A transport / protocol failure is returned as
-/// `Err`.
+/// Returns the next token to persist (equal to `token` if nothing changed,
+/// or `None` if the server rejected the token and a fresh baseline is
+/// needed). A transport / protocol failure is returned as `Err`.
 pub async fn poll_once(
     connector: &TlsConnector,
     account: &CardDavAccount,
@@ -36,60 +49,105 @@ pub async fn poll_once(
     events: &mpsc::Sender<ChangeEvent>,
     handshake_sem: &Arc<Semaphore>,
 ) -> Result<Option<String>> {
-    // NOTE: a first-ever sync (no token) enumerates the whole
-    // collection; suppress its members so a freshly activated watch does
-    // not flood the endpoint.
     let baseline = token.is_none();
-    let mut cursor = token;
+    let (host, port, base_url, path) = account.parts()?;
+    let backend = CarillonCardDavBackend {
+        url: account.url.clone(),
+        login: account.login.clone(),
+        // Core's poll ignores the interval (the driver owns it); a
+        // placeholder keeps the shared backend type honest.
+        poll: Duration::ZERO,
+    };
+    let credential = match &account.auth {
+        CardDavAuth::Password(secret) => {
+            CarillonCredential::Password(SecretString::from(secret.expose_secret().to_owned()))
+        }
+        CardDavAuth::Bearer(secret) => {
+            CarillonCredential::Bearer(SecretString::from(secret.expose_secret().to_owned()))
+        }
+    };
 
+    let mut cursor = token;
     loop {
+        // NOTE: throttle simultaneous handshakes across all watchers,
+        // holding the permit only for the network exchange.
         let permit = handshake_sem
             .clone()
             .acquire_owned()
             .await
             .expect("handshake semaphore never closes");
-        let delta = session::sync_changes(connector, account, cursor.as_deref()).await;
+        let exchange = async {
+            let mut stream = session::open(connector, &host, port).await?;
+            let mut poll = CarillonCardDavPoll::new(
+                &base_url,
+                &backend,
+                &credential,
+                &path,
+                cursor.as_deref(),
+            );
+            drive_poll(&mut stream, &mut poll).await
+        }
+        .await;
         drop(permit);
+        let change = exchange?;
 
-        let delta = match delta {
-            Ok(delta) => delta,
-            // NOTE: the token is no longer valid; reset to a fresh
-            // baseline next poll.
-            Err(SyncPollError::InvalidToken) => return Ok(None),
-            Err(SyncPollError::Other(err)) => return Err(err),
-        };
+        // NOTE: the token is no longer valid; reset to a fresh baseline
+        // next poll.
+        if change.invalid_token {
+            return Ok(None);
+        }
 
-        if !baseline {
-            for change in &delta.changed {
-                // NOTE: a poll can't tell a created contact from an
-                // edited one (both are just a changed etag), so report
-                // the honest "changed".
-                let event = ChangeEvent::carddav(
-                    watch_id,
-                    ChangeKind::Changed,
-                    session::resource_id(&change.href),
-                );
-                if events.send(event).await.is_err() {
-                    bail!("delivery channel closed");
-                }
-            }
-            for href in &delta.vanished {
-                let event =
-                    ChangeEvent::carddav(watch_id, ChangeKind::Removed, session::resource_id(href));
-                if events.send(event).await.is_err() {
-                    bail!("delivery channel closed");
-                }
+        let next = change.state.or_else(|| cursor.clone());
+
+        // NOTE: the content-free doorbell — one ring per poll that saw any
+        // change, carrying the new sync-token as the opaque resync state.
+        if !baseline && change.changed {
+            let event = ChangeEvent::new(watch_id, "carddav", account.url.clone(), next.clone());
+            if events.send(event).await.is_err() {
+                bail!("delivery channel closed");
             }
         }
 
-        let next = delta.sync_token.or_else(|| cursor.clone());
-
         // NOTE: drain a truncated result set (RFC 6578 §3.6) before
         // returning, so a large first sync fully checkpoints in one poll.
-        if delta.truncated && next.is_some() && next != cursor {
+        if change.truncated && next.is_some() && next != cursor {
             cursor = next;
             continue;
         }
         return Ok(next);
+    }
+}
+
+/// Drives one `CarillonCardDavPoll` to completion over an async stream,
+/// performing each read and write it requests (an empty slice on EOF, so a
+/// close-delimited body finalizes).
+async fn drive_poll<S>(
+    stream: &mut S,
+    poll: &mut CarillonCardDavPoll,
+) -> Result<CarillonCardDavChange>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; READ_BUF];
+    let mut pending: Option<usize> = None;
+    let mut eof = false;
+    loop {
+        let input = pending.take().map(|n| &buf[..n]);
+        match poll.resume(input) {
+            CarillonCardDavPollProgress::WantsWrite(bytes) => {
+                stream.write_all(&bytes).await.context("write failed")?;
+            }
+            CarillonCardDavPollProgress::WantsRead => {
+                if eof {
+                    bail!("connection closed by peer");
+                }
+                let n = stream.read(&mut buf).await.context("read failed")?;
+                if n == 0 {
+                    eof = true;
+                }
+                pending = Some(n);
+            }
+            CarillonCardDavPollProgress::Done(result) => return result.map_err(Into::into),
+        }
     }
 }

@@ -1,5 +1,5 @@
 {
-  description = "Carillon backend";
+  description = "Carillon watch server";
 
   inputs = {
     nixpkgs = {
@@ -28,10 +28,10 @@
         sops = import ./nix/sops.nix;
       };
 
-      # Adds `pkgs.carillon-backend` (this flake's build) so the module's default
+      # Adds `pkgs.carillon-server` (this flake's build) so the module's default
       # `package` resolves. Consumers add this to `nixpkgs.overlays`.
       overlays.default = final: _prev: {
-        carillon-backend = inputs.self.packages.${final.stdenv.hostPlatform.system}.default;
+        carillon-server = inputs.self.packages.${final.stdenv.hostPlatform.system}.default;
       };
 
       # Local dev/test targets (see cairn/spec/nixos.md "Testing locally"). Both run

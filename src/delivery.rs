@@ -101,7 +101,7 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
         let response = client
             .post(&watch.notify_url)
             .header("content-type", "application/json")
-            .header("x-carillon-event", event.event.as_str())
+            .header("x-carillon-source", event.source)
             .header("x-carillon-account", &event.account)
             .header("x-carillon-id", &event.id)
             .header("x-carillon-signature", &signature)
@@ -135,16 +135,16 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
     if ok {
         info!(
             account = %event.account,
-            event = event.event.as_str(),
-            uid = event.uid,
+            source = event.source,
+            target = %event.target,
             attempts,
             "delivered",
         );
     } else {
         warn!(
             account = %event.account,
-            event = event.event.as_str(),
-            uid = event.uid,
+            source = event.source,
+            target = %event.target,
             attempts,
             error = ?last_error,
             "delivery failed",
@@ -158,22 +158,22 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
         watch.account_id.clone(),
         LiveEvent::delivery(
             event.account.clone(),
-            event.event.as_str(),
-            event.uid,
+            event.source,
+            event.target.clone(),
             ok,
             last_status,
             attempts,
         ),
     ));
 
-    let event_kind = event.event.as_str().to_owned();
-    let uid = event.uid;
+    let source = event.source;
+    let target = event.target.clone();
     let error = last_error;
     tokio::task::spawn_blocking(move || {
         store.log_delivery(&DeliveryOutcome {
             account: &account,
-            event: &event_kind,
-            uid,
+            source,
+            target: &target,
             ok,
             status: last_status,
             error: error.as_deref(),

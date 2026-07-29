@@ -77,10 +77,10 @@ impl Crypto {
             .context("Stored secret is not valid base64")?;
         // NOTE: the decrypted bytes zeroize on drop; the SecretString takes
         // its own zeroizing copy, so no plaintext survives this call.
-        let plaintext = Zeroizing::new(
-            age::decrypt(&self.identity, &bytes).context("Cannot decrypt secret")?,
-        );
-        let text = std::str::from_utf8(&plaintext).context("Decrypted secret is not valid UTF-8")?;
+        let plaintext =
+            Zeroizing::new(age::decrypt(&self.identity, &bytes).context("Cannot decrypt secret")?);
+        let text =
+            std::str::from_utf8(&plaintext).context("Decrypted secret is not valid UTF-8")?;
         Ok(SecretString::from(text.to_owned()))
     }
 }
@@ -95,7 +95,10 @@ mod tests {
 
     fn temp_crypto() -> Crypto {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("carillon-crypto-test-{}-{n}.key", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "carillon-crypto-test-{}-{n}.key",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let crypto = Crypto::load_or_create(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -109,7 +112,10 @@ mod tests {
         // Both paths recover the same plaintext; the secret one just holds
         // it in a zeroizing type.
         assert_eq!(crypto.decrypt(&enc).unwrap(), "hunter2 🔐");
-        assert_eq!(crypto.decrypt_secret(&enc).unwrap().expose_secret(), "hunter2 🔐");
+        assert_eq!(
+            crypto.decrypt_secret(&enc).unwrap().expose_secret(),
+            "hunter2 🔐"
+        );
     }
 
     #[test]

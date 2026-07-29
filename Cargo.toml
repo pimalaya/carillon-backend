@@ -1,6 +1,6 @@
 [package]
-name = "carillon-backend"
-description = "Carillon backend"
+name = "carillon-server"
+description = "Carillon watch server"
 version = "0.1.0"
 authors = ["soywod <clement.douin@posteo.net>"]
 rust-version = "1.88"
@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 categories = ["email", "command-line-utilities"]
 keywords = ["imap", "webhook", "watch", "notification", "idle"]
 homepage = "https://pimalaya.org"
-repository = "https://github.com/pimalaya/carillon-backend"
+repository = "https://github.com/pimalaya/carillon-server"
 
 [profile.release]
 lto = "fat"
@@ -22,6 +22,7 @@ age = "0.12"
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
+carillon-core = { path = "../core", default-features = false, features = ["imap", "carddav"] }
 hex = "0.4"
 hmac = "0.13"
 io-http = { version = "0.3", default-features = false }

@@ -1,4 +1,4 @@
-# 🔔 Carillon backend [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
+# 🔔 Carillon server [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
 
 Watch server holding IMAP IDLE and emitting content-free webhooks
 
@@ -35,7 +35,7 @@ Carillon signals; it never syncs. It emits that something changed on a remote ma
 ### Cargo
 
 ```sh
-cargo install --locked --git https://github.com/pimalaya/carillon-backend.git
+cargo install --locked --git https://github.com/pimalaya/carillon-server.git
 ```
 
 ### Nix
@@ -43,20 +43,20 @@ cargo install --locked --git https://github.com/pimalaya/carillon-backend.git
 With the [Flakes](https://nixos.wiki/wiki/Flakes) feature enabled:
 
 ```sh
-nix profile install github:pimalaya/carillon-backend
+nix profile install github:pimalaya/carillon-server
 ```
 
 Or run without installing:
 
 ```sh
-nix run github:pimalaya/carillon-backend
+nix run github:pimalaya/carillon-server
 ```
 
 ### Sources
 
 ```sh
-git clone https://github.com/pimalaya/carillon-backend
-cd carillon-backend
+git clone https://github.com/pimalaya/carillon-server
+cd carillon-server
 nix run
 ```
 
@@ -66,7 +66,7 @@ The configuration is infrastructure only: the sqlite store, the age key and a fe
 
 ## Usage
 
-Run `carillon-backend --help` for the two subcommands: `serve` runs the daemon, `import` bulk-loads watches into the store. The control API is described by the OpenAPI contract at [openapi.yaml](./openapi.yaml); the design spec, serving fronts, webhook payload and production runbook live in the [cairn](./cairn) folder, which follows the [Cairn](https://github.com/pimalaya/cairn) convention (`spec/` current design, `changes/` proposals, `log/` history).
+Run `carillon-server --help` for the two subcommands: `serve` runs the daemon, `import` bulk-loads watches into the store. The control API is described by the OpenAPI contract at [openapi.yaml](./openapi.yaml); the design spec, serving fronts, webhook payload and production runbook live in the [cairn](./cairn) folder, which follows the [Cairn](https://github.com/pimalaya/cairn) convention (`spec/` current design, `changes/` proposals, `log/` history).
 
 ## License
 

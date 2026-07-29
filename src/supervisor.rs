@@ -15,9 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::Context;
+use carillon_core::backend::CarillonImapBackend;
+use carillon_core::credential::CarillonCredential;
+use carillon_core::imap::CarillonImapWatch;
 use io_imap::types::mailbox::Mailbox;
-use io_imap::types::response::Capability;
-use io_imap::watch::ImapMailboxWatch;
 use rand::RngExt;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -28,8 +29,8 @@ use url::Url;
 
 use crate::carddav::pump as carddav_pump;
 use crate::carddav::session::{CardDavAccount, CardDavAuth};
-use secrecy::SecretString;
 use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::crypto::Crypto;
 use crate::event::ChangeEvent;
@@ -52,7 +53,8 @@ enum Credential {
     Oauth,
 }
 
-/// Bound on the whole TCP + TLS + greeting + login handshake.
+/// Bound on the TCP + TLS handshake (carillon-core then greets,
+/// authenticates and holds IDLE over the returned stream).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Reconnect backoff floor.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
@@ -401,17 +403,16 @@ async fn watch_loop(ctx: WatchLoop) {
     let status =
         |state, detail| Routed::new(account_id.clone(), LiveEvent::status(&id, state, detail));
 
-    let mailbox: Mailbox<'static> = match Mailbox::try_from(account.mailbox.clone()) {
-        Ok(mailbox) => mailbox,
-        Err(_) => {
-            error!(watch = %id, mailbox = %account.mailbox, "invalid mailbox name");
-            let _ = live.send(status(
-                WatchState::Error,
-                Some("invalid mailbox name".into()),
-            ));
-            return;
-        }
-    };
+    // NOTE: validate the mailbox name early for a clean error; core
+    // re-parses it internally when it drives the watch.
+    if Mailbox::try_from(account.mailbox.clone()).is_err() {
+        error!(watch = %id, mailbox = %account.mailbox, "invalid mailbox name");
+        let _ = live.send(status(
+            WatchState::Error,
+            Some("invalid mailbox name".into()),
+        ));
+        return;
+    }
 
     let mut backoff = INITIAL_BACKOFF;
 
@@ -448,56 +449,42 @@ async fn watch_loop(ctx: WatchLoop) {
             .await
             .expect("handshake semaphore never closes");
         let started = Instant::now();
-        let connected = timeout(CONNECT_TIMEOUT, session::connect(&connector, &account)).await;
+        let connected = timeout(CONNECT_TIMEOUT, session::connect_tls(&connector, &account)).await;
         drop(permit);
 
         match connected {
-            Ok(Ok(mut session)) => {
-                // NOTE: full QRESYNC deltas where supported, else the
-                // IDLE-only new-mail watcher (Gmail, Yahoo, …).
-                let has_qresync = session.capabilities.contains(&Capability::QResync);
+            Ok(Ok(mut stream)) => {
                 info!(
                     watch = %id,
                     host = %account.host,
                     mailbox = %account.mailbox,
-                    qresync = has_qresync,
                     "watching",
                 );
                 let _ = live.send(status(WatchState::Watching, None));
 
-                let outcome = if has_qresync {
-                    match ImapMailboxWatch::new(
-                        &session.capabilities,
-                        mailbox.clone(),
-                        shutdown.clone(),
-                    ) {
-                        Ok(watcher) => {
-                            pump::run_watch(
-                                &id,
-                                &mut session.stream,
-                                &mut session.fragmentizer,
-                                watcher,
-                                &events,
-                            )
-                            .await
-                        }
-                        Err(err) => {
-                            error!(watch = %id, error = %err, "watcher cannot start; giving up");
-                            let _ = live.send(status(WatchState::Error, Some(err.to_string())));
-                            return;
-                        }
-                    }
-                } else {
-                    pump::run_watch_idle(
-                        &id,
-                        &mut session.stream,
-                        &mut session.fragmentizer,
-                        mailbox.clone(),
-                        shutdown.clone(),
-                        &events,
-                    )
-                    .await
+                // NOTE: carillon-core greets, authenticates, EXAMINEs and
+                // holds IDLE over the raw stream — the same watcher the CLI
+                // drives; the server owns only the socket and the reconnect.
+                // The content-free ring carries the opaque resync token, no
+                // uid or change kind.
+                let backend = CarillonImapBackend {
+                    host: account.host.clone(),
+                    port: account.port,
+                    login: account.login.clone(),
+                    mailbox: account.mailbox.clone(),
                 };
+                let credential = match &account.auth {
+                    ImapAuth::Password(secret) => CarillonCredential::Password(SecretString::from(
+                        secret.expose_secret().to_owned(),
+                    )),
+                    ImapAuth::OauthBearer(secret) => CarillonCredential::Bearer(
+                        SecretString::from(secret.expose_secret().to_owned()),
+                    ),
+                };
+                let watch = CarillonImapWatch::new(backend, credential, shutdown.clone());
+
+                let outcome =
+                    pump::run_watch_core(&id, &account.mailbox, &mut stream, watch, &events).await;
 
                 match outcome {
                     Ok(()) => debug!(watch = %id, "session ended; reconnecting"),

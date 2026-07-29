@@ -6,7 +6,7 @@
 //!
 //! Watches (accounts) do not live here: the store is their sole source
 //! of truth, and they enter it through the control API or the one-shot
-//! `carillon-backend import` command (see [`ImportFile`]).
+//! `carillon-server import` command (see [`ImportFile`]).
 
 use std::{
     collections::BTreeMap,

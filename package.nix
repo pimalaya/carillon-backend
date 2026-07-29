@@ -20,13 +20,13 @@ in
 rustPlatform.buildRustPackage {
   inherit version buildNoDefaultFeatures buildFeatures;
 
-  pname = "carillon-backend";
+  pname = "carillon-server";
   cargoHash = "";
 
   src = fetchFromGitHub {
     hash = "";
     owner = "pimalaya";
-    repo = "carillon-backend";
+    repo = "carillon-server";
     rev = "v${version}";
   };
 
@@ -36,8 +36,8 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "Carillon watch server: holds IMAP IDLE and emits content-free webhooks";
-    mainProgram = "carillon-backend";
-    homepage = "https://github.com/pimalaya/carillon-backend";
+    mainProgram = "carillon-server";
+    homepage = "https://github.com/pimalaya/carillon-server";
     license = with lib.licenses; [
       mit
       asl20

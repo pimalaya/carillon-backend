@@ -8,4 +8,4 @@
 
 ## Reporting a Vulnerability
 
-https://github.com/pimalaya/carillon-backend/issues
+https://github.com/pimalaya/carillon-server/issues

@@ -7,7 +7,7 @@ info:
     The REST + SSE control surface of the Carillon watch server. Carillon
     signals, it never syncs: it holds IMAP IDLE and POSTs small, signed,
     **content-free** change events to each watch's notify URL. This API is
-    the contract `carillon-frontend` (and any third-party UI) builds against.
+    the contract `carillon-admin` (and any third-party UI) builds against.
 
     All bodies are JSON. Timestamps are unix seconds. Watch-time balances
     are in seconds.
@@ -964,13 +964,15 @@ components:
       type: object
       properties:
         account: { type: string }
-        event: { type: string, enum: [new, changed, flags_added, flags_removed, removed] }
-        uid:
-          type: integer
+        source:
+          type: string
+          enum: [imap, carddav]
+          description: The account kind that rang.
+        target:
+          type: string
           description: >
-            Affected IMAP UID. `0` for a CardDAV delivery, which identifies
-            the changed contact by an opaque href reference in the webhook
-            payload's `resource` field instead (flag events never occur).
+            The watched thing that changed — a mailbox name for `imap`, a
+            collection reference for `carddav`. Opaque to the consumer.
         ok: { type: boolean }
         status: { type: [integer, "null"] }
         error: { type: [string, "null"] }

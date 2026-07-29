@@ -1,10 +1,11 @@
-//! IMAP connection setup: TCP, TLS, greeting and authentication.
+//! IMAP connection setup for the one-shot paths: TCP, TLS, greeting and
+//! authentication.
 //!
-//! Produces a live authenticated [`Session`] for the mailbox watcher,
-//! and a read-only [`probe`] that connects, inspects capabilities and
-//! logs out without selecting a mailbox: the basis of the `/test`
-//! endpoint. All the coroutines are driven by the async
-//! [`crate::imap::pump`].
+//! Exposes [`connect_tls`] (a raw post-TLS stream, handed to carillon-core
+//! for the standing watch), a read-only [`probe`] that connects, inspects
+//! capabilities and logs out without selecting a mailbox (the basis of the
+//! `/test` endpoint), and [`list_mailboxes`] for onboarding. All the
+//! coroutines are driven by the async [`crate::imap::pump`].
 
 use std::time::Duration;
 
@@ -18,8 +19,8 @@ use io_imap::rfc7628::auth_oauthbearer::{ImapAuthOauthbearer, ImapAuthOauthbeare
 use io_imap::types::flag::FlagNameAttribute;
 use io_imap::types::mailbox::{ListMailbox, Mailbox};
 use io_imap::types::response::Capability;
-use secrecy::{ExposeSecret, SecretString};
 use rustls::pki_types::ServerName;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
@@ -71,23 +72,14 @@ pub struct ImapAccount {
     pub mailbox: String,
 }
 
-/// A live, authenticated IMAP session.
-pub struct Session {
-    /// The negotiated TLS stream.
-    pub stream: TlsStream<TcpStream>,
-    /// The connection-wide parser buffer, shared across coroutines.
-    pub fragmentizer: Fragmentizer,
-    /// Post-authentication capabilities (where QRESYNC surfaces).
-    pub capabilities: Vec<Capability<'static>>,
-}
-
-/// Opens TCP + TLS and reads the greeting, leaving a stream ready to
-/// authenticate. Success means the server is reachable (DNS, TCP, TLS and
-/// a valid greeting all worked).
-async fn open(
+/// Opens TCP + TLS to the account and returns the raw negotiated stream,
+/// reading **no** greeting. This is the entry point for the standing
+/// watch, whose driver (carillon-core) greets and authenticates itself.
+/// SSRF guard and keepalive are applied here.
+pub async fn connect_tls(
     connector: &TlsConnector,
     account: &ImapAccount,
-) -> Result<(TlsStream<TcpStream>, Fragmentizer)> {
+) -> Result<TlsStream<TcpStream>> {
     // NOTE: resolve + SSRF-check first, then connect to that exact
     // address (rebinding-safe). TLS still uses the hostname for SNI +
     // certificate verification below.
@@ -106,10 +98,22 @@ async fn open(
 
     let server_name = ServerName::try_from(account.host.clone())
         .with_context(|| format!("Invalid TLS server name: {}", account.host))?;
-    let mut stream = connector
+    let stream = connector
         .connect(server_name, tcp)
         .await
         .context("TLS handshake failed")?;
+    Ok(stream)
+}
+
+/// Opens TCP + TLS and reads the greeting, leaving a stream ready to
+/// authenticate. Success means the server is reachable (DNS, TCP, TLS and
+/// a valid greeting all worked). Used by the one-shot paths (probe,
+/// listing, `/test`); the standing watch uses [`connect_tls`] instead.
+async fn open(
+    connector: &TlsConnector,
+    account: &ImapAccount,
+) -> Result<(TlsStream<TcpStream>, Fragmentizer)> {
+    let mut stream = connect_tls(connector, account).await?;
 
     let mut fragmentizer = Fragmentizer::new(MAX_MESSAGE_SIZE);
 
@@ -168,19 +172,6 @@ async fn authenticate(
     }
 }
 
-/// Opens TCP + TLS, reads the greeting and authenticates with LOGIN,
-/// returning the post-login capabilities.
-pub async fn connect(connector: &TlsConnector, account: &ImapAccount) -> Result<Session> {
-    let (mut stream, mut fragmentizer) = open(connector, account).await?;
-    let capabilities = authenticate(&mut stream, &mut fragmentizer, account).await?;
-
-    Ok(Session {
-        stream,
-        fragmentizer,
-        capabilities,
-    })
-}
-
 /// The structured outcome of probing an account, stage by stage. Never
 /// selects a mailbox and issues no write: the read-only basis of the
 /// `/test` endpoint.
@@ -203,9 +194,9 @@ pub struct Probe {
 
 impl Probe {
     /// Watchable iff reachable, authenticated and advertising IDLE, the
-    /// one hard requirement (the wake signal). QRESYNC is optional: with
-    /// it the watcher tracks new/flags/removed via `run_watch`; without
-    /// it the IDLE-only `run_watch_idle` path tracks new mail only.
+    /// one hard requirement (the wake signal). carillon-core then rings on
+    /// the CONDSTORE `UIDVALIDITY:HIGHESTMODSEQ` token when advertised,
+    /// else `UIDVALIDITY:UIDNEXT` (new mail only).
     pub fn watchable(&self) -> bool {
         self.reachable && self.authenticated && self.idle
     }

@@ -13,8 +13,8 @@
 //!
 //! Two subcommands:
 //!
-//! - `carillon-backend serve [config]` (the default) runs the daemon.
-//! - `carillon-backend import <accounts.toml> [config]` populates the store from
+//! - `carillon-server serve [config]` (the default) runs the daemon.
+//! - `carillon-server import <accounts.toml> [config]` populates the store from
 //!   an [`config::ImportFile`] and exits.
 
 mod api;
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
         Some("import") => {
             let accounts = args
                 .get(2)
-                .context("usage: carillon-backend import <accounts.toml> [config]")?;
+                .context("usage: carillon-server import <accounts.toml> [config]")?;
             let config = load_config(args.get(3).map(String::as_str))?;
             import(&config, accounts.as_ref())
         }
@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
             serve(config).await
         }
         // NOTE: no subcommand or a bare config path both serve, for
-        // convenience (`carillon-backend` / `carillon-backend carillon.toml`).
+        // convenience (`carillon-server` / `carillon-server carillon.toml`).
         Some(flag) if flag.starts_with('-') => bail!("unknown flag: {flag}"),
         other => {
             let config = load_config(other)?;

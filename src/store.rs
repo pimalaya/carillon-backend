@@ -118,8 +118,8 @@ CREATE TABLE IF NOT EXISTS password_credential (
 CREATE TABLE IF NOT EXISTS delivery (
   id       INTEGER PRIMARY KEY AUTOINCREMENT,
   account  TEXT NOT NULL,
-  event    TEXT NOT NULL,
-  uid      INTEGER NOT NULL,
+  source   TEXT NOT NULL,
+  target   TEXT NOT NULL,
   ok       INTEGER NOT NULL,
   status   INTEGER,
   error    TEXT,
@@ -315,10 +315,10 @@ impl Watch {
 pub struct DeliveryRow {
     /// Owning watch id.
     pub account: String,
-    /// Event kind (`new`, `flags_added`, ...).
-    pub event: String,
-    /// Affected UID.
-    pub uid: u32,
+    /// Source kind that rang (`imap`, `carddav`).
+    pub source: String,
+    /// The watched thing that changed (mailbox / collection).
+    pub target: String,
     /// Whether the endpoint acknowledged (2xx).
     pub ok: bool,
     /// Final HTTP status, if any response was received.
@@ -335,8 +335,8 @@ impl DeliveryRow {
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
             account: row.get("account")?,
-            event: row.get("event")?,
-            uid: row.get("uid")?,
+            source: row.get("source")?,
+            target: row.get("target")?,
             ok: row.get::<_, i64>("ok")? != 0,
             status: row.get::<_, Option<i64>>("status")?.map(|s| s as u16),
             error: row.get("error")?,
@@ -350,10 +350,10 @@ impl DeliveryRow {
 pub struct DeliveryOutcome<'a> {
     /// Owning watch id.
     pub account: &'a str,
-    /// Event kind (`new`, `flags_added`, ...).
-    pub event: &'a str,
-    /// Affected UID.
-    pub uid: u32,
+    /// Source kind that rang (`imap`, `carddav`).
+    pub source: &'a str,
+    /// The watched thing that changed (mailbox / collection).
+    pub target: &'a str,
     /// Whether the endpoint acknowledged (2xx).
     pub ok: bool,
     /// Final HTTP status, if any response was received.
@@ -644,12 +644,12 @@ impl Store {
     pub fn log_delivery(&self, outcome: &DeliveryOutcome) -> Result<()> {
         let at = now_secs();
         self.lock().execute(
-            "INSERT INTO delivery (account, event, uid, ok, status, error, attempts, at)
+            "INSERT INTO delivery (account, source, target, ok, status, error, attempts, at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 outcome.account,
-                outcome.event,
-                outcome.uid,
+                outcome.source,
+                outcome.target,
                 outcome.ok as i64,
                 outcome.status.map(|s| s as i64),
                 outcome.error,
