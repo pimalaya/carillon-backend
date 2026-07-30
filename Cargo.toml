@@ -21,12 +21,12 @@ panic = "abort"
 age = "0.12"
 anyhow = "1"
 axum = "0.8"
-base64 = "0.22"
-carillon-core = { path = "../core", default-features = false, features = ["imap", "carddav"] }
+base64 = "0.23"
+carillon-core = { version = "0.0.0", default-features = false, features = ["imap", "carddav"] }
 hex = "0.4"
 hmac = "0.13"
 io-http = { version = "0.3", default-features = false }
-io-imap = { version = "0.2", default-features = false }
+io-imap = { version = "0.3", default-features = false }
 io-oauth = { version = "0.2", default-features = false, features = ["rustls-ring"] }
 io-pim-discovery = { version = "0.3", default-features = false, features = ["rustls-ring", "autoconfig", "pacc", "rfc6186", "rfc6764", "rfc8414"] }
 io-webdav = { version = "0.1", default-features = false }
@@ -52,5 +52,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
 [patch.crates-io]
+carillon-core.git = "https://github.com/pimalaya/carillon-core"
 io-imap.git = "https://github.com/pimalaya/io-imap"
 io-webdav.git = "https://github.com/pimalaya/io-webdav"
