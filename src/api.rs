@@ -373,8 +373,9 @@ async fn openapi() -> Response {
 }
 
 /// A CORS layer allowing the configured origin (`*` for any) with the
-/// `Authorization` bearer header, pairing with the localStorage
-/// capability link (no cookies/CSRF).
+/// `Authorization` bearer header, for a cross-origin (CDN) dashboard. The
+/// httpOnly `carillon_session` cookie is same-origin only (`SameSite=Strict`);
+/// a cross-origin front therefore keeps the Bearer path.
 fn cors_layer(origin: &str) -> CorsLayer {
     let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
@@ -514,8 +515,8 @@ async fn oauth_start(
     }
 
     // NOTE: join the account behind a presented capability link, if any.
-    let account_id =
-        bearer(&headers).and_then(|token| state.store.resolve_capability(&token).ok().flatten());
+    let account_id = session_token(&headers)
+        .and_then(|token| state.store.resolve_capability(&token).ok().flatten());
 
     let redirect_uri = format!("{}/oauth/callback", state.public_url.trim_end_matches('/'));
     let input = oauth::AuthInput {
@@ -792,21 +793,25 @@ async fn oauth_callback(
     match result {
         Ok(Ok((account_id, link))) => {
             info!(account = %account_id, "oauth login");
-            oauth_popup(
-                &state.dashboard_origin,
-                json!({
-                    "type": "carillon-oauth",
-                    "ok": true,
-                    "link": link,
-                    "account_id": account_id,
-                    "watchable": watchable,
-                    "missing": missing,
-                    "qresync": qresync,
-                    "login": login,
-                    "imap_host": imap_host,
-                    "imap_port": imap_port,
-                    "mailbox": mailbox,
-                }),
+            let cookie = session_cookie(&link, state.public_url.starts_with("https"));
+            attach_cookie(
+                oauth_popup(
+                    &state.dashboard_origin,
+                    json!({
+                        "type": "carillon-oauth",
+                        "ok": true,
+                        "link": link,
+                        "account_id": account_id,
+                        "watchable": watchable,
+                        "missing": missing,
+                        "qresync": qresync,
+                        "login": login,
+                        "imap_host": imap_host,
+                        "imap_port": imap_port,
+                        "mailbox": mailbox,
+                    }),
+                ),
+                cookie,
             )
         }
         _ => oauth_popup(&state.dashboard_origin, oauth_err("server error")),
@@ -918,7 +923,7 @@ async fn test_connect(
         let auth = if !request.password.is_empty() {
             CardDavAuth::Password(SecretString::from(request.password.clone()))
         } else {
-            let Some(token) = bearer(&headers) else {
+            let Some(token) = session_token(&headers) else {
                 return unauthorized();
             };
             let account_id = match state.store.resolve_capability(&token) {
@@ -1046,7 +1051,7 @@ async fn list_mailboxes(
     // LOGIN) or, failing that, OAuth (mint a fresh bearer token), as the
     // watcher resolves it.
     if request.password.is_empty() {
-        let Some(token) = bearer(&headers) else {
+        let Some(token) = session_token(&headers) else {
             return unauthorized();
         };
         let account_id = match state.store.resolve_capability(&token) {
@@ -1181,7 +1186,7 @@ async fn list_addressbooks(
     let auth = if !request.password.is_empty() {
         CardDavAuth::Password(SecretString::from(request.password.clone()))
     } else {
-        let Some(token) = bearer(&headers) else {
+        let Some(token) = session_token(&headers) else {
             return unauthorized();
         };
         let account_id = match state.store.resolve_capability(&token) {
@@ -1992,7 +1997,7 @@ impl FromRequestParts<AppState> for Caller {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Response> {
-        let token = bearer(&parts.headers).ok_or_else(unauthorized)?;
+        let token = session_token(&parts.headers).ok_or_else(unauthorized)?;
         // NOTE: the admin token, if configured, wins. Compare digests so
         // the comparison leaks nothing exploitable about the secret.
         if let Some(admin) = &state.admin_token
@@ -2029,7 +2034,7 @@ impl FromRequestParts<AppState> for CapabilityAccount {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Response> {
-        let token = bearer(&parts.headers).ok_or_else(unauthorized)?;
+        let token = session_token(&parts.headers).ok_or_else(unauthorized)?;
         match state.store.resolve_capability(&token) {
             Ok(Some(account_id)) => match state.store.is_blocked(&account_id) {
                 Ok(false) => Ok(CapabilityAccount(account_id)),
@@ -2067,7 +2072,7 @@ impl FromRequestParts<AppState> for AdminCaller {
                 identity: "dev-insecure".to_string(),
             });
         }
-        let token = bearer(&parts.headers).ok_or_else(unauthorized)?;
+        let token = session_token(&parts.headers).ok_or_else(unauthorized)?;
         // NOTE: break-glass token wins; digest compare leaks nothing.
         if let Some(admin) = &state.admin_token
             && token_matches(&token, admin)
@@ -2096,6 +2101,58 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .ok()?
         .strip_prefix("Bearer ")
         .map(|token| token.trim().to_string())
+}
+
+/// Name of the httpOnly cookie carrying the browser's capability-link session.
+const SESSION_COOKIE: &str = "carillon_session";
+
+/// Resolves the capability link from either the `Authorization: Bearer` header
+/// (programmatic / CLI callers) or the `carillon_session` httpOnly cookie (the
+/// browser dashboard). Bearer wins when both are present.
+fn session_token(headers: &HeaderMap) -> Option<String> {
+    bearer(headers).or_else(|| cookie_value(headers, SESSION_COOKIE))
+}
+
+/// Reads one cookie value out of the `Cookie` header.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(key, _)| key.trim() == name)
+        .map(|(_, value)| value.trim().to_string())
+}
+
+/// The `Set-Cookie` value that plants the capability link as the browser
+/// session. `HttpOnly` keeps JS from reading it, `SameSite=Strict` is the CSRF
+/// defense, and `Secure` is set for https deployments.
+fn session_cookie(link: &str, secure: bool) -> String {
+    let ttl = CAPABILITY_TTL.as_secs();
+    let mut cookie =
+        format!("{SESSION_COOKIE}={link}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl}");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// The `Set-Cookie` value that immediately expires the session cookie.
+fn expire_session_cookie(secure: bool) -> String {
+    let mut cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// Appends a pre-built `Set-Cookie` value to a response.
+fn attach_cookie(mut resp: Response, cookie: String) -> Response {
+    if let Ok(value) = cookie.parse() {
+        resp.headers_mut().append(header::SET_COOKIE, value);
+    }
+    resp
 }
 
 fn unauthorized() -> Response {
@@ -2214,7 +2271,7 @@ async fn auth(
         Err(err) => return AppError(err).into_response(),
     };
 
-    let existing = bearer(&headers);
+    let existing = session_token(&headers);
     let store = state.store.clone();
     let login = request.login.clone();
     let protocol = request.protocol.clone();
@@ -2289,16 +2346,20 @@ async fn auth(
     match result {
         Ok(Ok(Some((account_id, action, link)))) => {
             info!(account = %account_id, action, protocol = %request.protocol, "auth");
-            Json(json!({
-                "account_id": account_id,
-                "action": action,
-                "link": link,
-                "protocol": request.protocol,
-                "watchable": watchable,
-                "idle": idle,
-                "qresync": qresync,
-            }))
-            .into_response()
+            let cookie = session_cookie(&link, state.public_url.starts_with("https"));
+            attach_cookie(
+                Json(json!({
+                    "account_id": account_id,
+                    "action": action,
+                    "link": link,
+                    "protocol": request.protocol,
+                    "watchable": watchable,
+                    "idle": idle,
+                    "qresync": qresync,
+                }))
+                .into_response(),
+                cookie,
+            )
         }
         Ok(Ok(None)) => forbidden("account is blocked"),
         _ => AppError(anyhow::anyhow!("auth failed")).into_response(),
@@ -2421,7 +2482,11 @@ async fn magic_verify(
     match tokio::task::spawn_blocking(move || verify_magic(&store, &token)).await {
         Ok(Ok(Some((account_id, link)))) => {
             info!(account = %account_id, "magic sign-in");
-            Json(json!({ "account_id": account_id, "link": link })).into_response()
+            let cookie = session_cookie(&link, state.public_url.starts_with("https"));
+            attach_cookie(
+                Json(json!({ "account_id": account_id, "link": link })).into_response(),
+                cookie,
+            )
         }
         Ok(Ok(None)) => (
             StatusCode::UNAUTHORIZED,
@@ -2472,9 +2537,13 @@ async fn magic_verify_confirm(
     match tokio::task::spawn_blocking(move || verify_magic(&store, &token)).await {
         Ok(Ok(Some((account_id, link)))) => {
             info!(account = %account_id, "magic sign-in");
-            oauth_popup(
-                &state.dashboard_origin,
-                json!({ "type": "carillon-magic", "ok": true, "link": link, "account_id": account_id }),
+            let cookie = session_cookie(&link, state.public_url.starts_with("https"));
+            attach_cookie(
+                oauth_popup(
+                    &state.dashboard_origin,
+                    json!({ "type": "carillon-magic", "ok": true, "link": link, "account_id": account_id }),
+                ),
+                cookie,
             )
         }
         Ok(Ok(None)) => oauth_popup(
@@ -2565,7 +2634,7 @@ async fn me(
 
 /// `POST /signout`: revoke the presented capability link.
 async fn signout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(token) = bearer(&headers) else {
+    let Some(token) = session_token(&headers) else {
         return unauthorized();
     };
     let store = state.store.clone();
@@ -2573,7 +2642,11 @@ async fn signout(State(state): State<AppState>, headers: HeaderMap) -> Response 
         .await
         .unwrap_or(Ok(false))
         .unwrap_or(false);
-    Json(json!({ "status": "ok", "revoked": revoked })).into_response()
+    let cookie = expire_session_cookie(state.public_url.starts_with("https"));
+    attach_cookie(
+        Json(json!({ "status": "ok", "revoked": revoked })).into_response(),
+        cookie,
+    )
 }
 
 /// Body of `POST /watches/{id}/activate`: how many credits to spend at once.
@@ -2917,6 +2990,53 @@ mod magic_verify_tests {
         let html = body_of(resp).await;
         assert!(!html.contains("<script>alert"));
         assert!(html.contains("value=\"\""));
+    }
+}
+
+#[cfg(test)]
+mod session_cookie_tests {
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
+
+    use super::{SESSION_COOKIE, expire_session_cookie, session_cookie, session_token};
+
+    fn headers(pairs: &[(HeaderName, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(name.clone(), HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn reads_the_session_cookie_when_no_bearer() {
+        let h = headers(&[(header::COOKIE, "a=1; carillon_session=deadbeef; b=2")]);
+        assert_eq!(session_token(&h).as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn bearer_wins_over_cookie() {
+        let h = headers(&[
+            (header::AUTHORIZATION, "Bearer tok"),
+            (header::COOKIE, "carillon_session=cookieval"),
+        ]);
+        assert_eq!(session_token(&h).as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn no_credentials_is_none() {
+        assert!(session_token(&HeaderMap::new()).is_none());
+        assert!(session_token(&headers(&[(header::COOKIE, "other=1")])).is_none());
+    }
+
+    #[test]
+    fn set_cookie_is_httponly_samesite_and_secure_only_on_https() {
+        let secure = session_cookie("abc", true);
+        assert!(secure.starts_with(&format!("{SESSION_COOKIE}=abc; ")));
+        assert!(secure.contains("HttpOnly"));
+        assert!(secure.contains("SameSite=Strict"));
+        assert!(secure.contains("; Secure"));
+        assert!(!session_cookie("abc", false).contains("; Secure"));
+        assert!(expire_session_cookie(true).contains("Max-Age=0"));
     }
 }
 

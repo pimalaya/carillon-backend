@@ -60,6 +60,11 @@ Three distinct keys, two of them on-box "decrypt-everything" keys:
   The magic-link **prefetch/scanner token-burn** availability gap is closed — the
   emailed `GET` no longer consumes the token (click-to-confirm `POST`; see [[auth]]).
   Interception and `localStorage`-XSS takeover remain 🟡, tracked separately.
+  The **server** now also accepts an httpOnly `carillon_session` cookie
+  (`SameSite=Strict`) so the browser need not hold a JS-readable token; the
+  `localStorage`-XSS item flips to 🟢 once the dashboard migrates onto it (frontend
+  change). An XSS can still act within a live cookie session, but cannot exfiltrate a
+  long-lived token.
 
 ## Layer 5 — Outbound / SSRF
 - The server originates connections to caller-supplied hosts/URLs. 🟢 guarded by
