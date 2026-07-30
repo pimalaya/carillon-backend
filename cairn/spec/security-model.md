@@ -51,7 +51,11 @@ Three distinct keys, two of them on-box "decrypt-everything" keys:
   `carddav/pump.rs`). A user can point a watch at a **malicious server** feeding
   malformed data; a parsing bug here is code execution **in the process holding
   decrypted credentials**. 🔴 first-class surface — treat with memory-safety
-  discipline, dependency hygiene, and fuzzing of the parsers.
+  discipline, dependency hygiene, and fuzzing of the parsers. A stable-Rust
+  **adversarial-input harness** now guards `CarillonImapWatch::resume` /
+  `CarillonCardDavPoll::resume` (no panic/hang on a hostile corpus; the 1 MiB
+  fragmentizer bound rejects oversized literals); coverage-guided fuzzing remains the
+  follow-up.
 - **Webhook delivery** to a user-supplied `notify_url`: 🟢 SSRF-guarded (Layer 5).
 - **Admin console**: 🟢 loopback-only + email-whitelist / break-glass token, code
   compiled to exclude the dev bypass in release (see [[auth]]).
@@ -81,7 +85,11 @@ Three distinct keys, two of them on-box "decrypt-everything" keys:
   the host. Bounds the honest claim (see [[credential-custody-boundary]]).
 - **Dependencies** (Rust crates, npm, flake inputs): 🔴 run **in-process** with the
   credentials; a compromised dependency is a full compromise. Reproducible builds +
-  dependency review are the answers.
+  dependency review are the answers. Dependency review is now an enforced gate:
+  `cargo deny check` (advisories + bans + licenses + sources via `deny.toml`) passes
+  green, and the **untrusted-server IMAP/CardDAV parsers carry an adversarial-input
+  test harness** in carillon-core (Layer 4). Coverage-guided fuzzing + a CI job that
+  runs `cargo deny` remain follow-ups.
 
 ## Layer 7 — Data beyond the box
 - **Backups**: 🔴 deferred (see [[backup-and-restore]]). When built: a second

@@ -1,3 +1,22 @@
+# cargo-deny policy for carillon-server — the credential-holding binary, whose
+# whole dependency tree runs in-process with decrypted secrets (security-model
+# Layer 6: "a compromised dependency is a full compromise"). Run: `cargo deny check`.
+
+[advisories]
+version = 2
+# Fail on a dependency pinned to a yanked release.
+yanked = "deny"
+# Add a RUSTSEC id here ONLY with a justification comment if ever unavoidable.
+ignore = []
+
+[bans]
+# Duplicate versions bloat the tree and widen the audit surface; surfaced, not fatal.
+multiple-versions = "warn"
+# Surface wildcard version requirements (the local path-dep dev workflow uses
+# some); reported, not fatal, so `cargo deny check` stays green in development.
+wildcards = "warn"
+allow-wildcard-paths = true
+
 [sources]
 allow-org.github = ["pimalaya"]
 unknown-git = "deny"
@@ -11,4 +30,5 @@ allow = [
   "ISC",
   "MIT",
   "Unicode-3.0",
+  "Zlib",
 ]
