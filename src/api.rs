@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, Form, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -152,6 +152,7 @@ pub fn router(
             "/auth/magic/verify",
             get(magic_verify_get).post(magic_verify),
         )
+        .route("/auth/magic/verify/confirm", post(magic_verify_confirm))
         .route("/me", get(me))
         .route("/signout", post(signout))
         .route("/watches", get(list_watches).post(create_watch))
@@ -834,7 +835,14 @@ fn oauth_popup(dashboard_origin: &str, payload: serde_json::Value) -> Response {
          <script>(function(){{try{{if(window.opener){{window.opener.postMessage({json},{origin});}}}}catch(e){{}}setTimeout(function(){{window.close();}},150);}})();</script>\
          </body></html>"
     );
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+    (
+        [
+            ("content-type", "text/html; charset=utf-8"),
+            ("referrer-policy", "no-referrer"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Body of `POST /test`: credentials to probe, read-only. `source_kind`
@@ -1485,8 +1493,8 @@ async fn create_watch(
         enc_password,
         mailbox: request.mailbox,
         notify_url: request.notify_url,
-        hmac_secret: request.hmac_secret,
-        hmac_secret_prev: None,
+        enc_hmac_secret: state.crypto.encrypt(&request.hmac_secret)?,
+        enc_hmac_secret_prev: None,
         hmac_secret_prev_expires: None,
         account_id: account_id.clone(),
         provider: provider.clone(),
@@ -1664,13 +1672,14 @@ async fn rotate_secret(
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_ROTATE_OVERLAP);
 
+    // NOTE: the secret is stored age-encrypted; the plaintext is returned
+    // to the caller (below) so they can configure their receiver.
+    let enc_secret = state.crypto.encrypt(&secret)?;
     let store = state.store.clone();
     let rotate_id = id.clone();
-    let rotate_secret = secret.clone();
-    let expires = tokio::task::spawn_blocking(move || {
-        store.rotate_secret(&rotate_id, &rotate_secret, overlap)
-    })
-    .await??;
+    let expires =
+        tokio::task::spawn_blocking(move || store.rotate_secret(&rotate_id, &enc_secret, overlap))
+            .await??;
 
     match expires {
         Some(prev_expires_at) => {
@@ -2431,17 +2440,35 @@ struct MagicVerifyQuery {
 }
 
 /// `GET /auth/magic/verify`: what the emailed link opens in the browser.
-/// Mints the capability link and hands it to the dashboard window that
-/// opened it (via `postMessage`), mirroring the OAuth popup.
-async fn magic_verify_get(
-    State(state): State<AppState>,
-    Query(query): Query<MagicVerifyQuery>,
-) -> Response {
-    if query.token.is_empty() {
-        return oauth_popup(&state.dashboard_origin, magic_err("missing token"));
+///
+/// This SHALL NOT consume the token: email security scanners (Outlook
+/// SafeLinks, corporate proxies/AV) and browser link-prefetchers issue this
+/// GET and would burn the single-use token before the human ever clicks,
+/// leaving the legitimate user with an "expired link". Instead it renders a
+/// one-click confirm page whose button POSTs to `/auth/magic/verify/confirm`,
+/// which does the consume. A plain form (no auto-submit) means a scanner that
+/// fetches the page but never submits cannot spend the token.
+async fn magic_verify_get(Query(query): Query<MagicVerifyQuery>) -> Response {
+    // A real token is bounded lowercase hex (`random_secret`); anything else
+    // cannot match a stored link, so refuse without reflecting it into the
+    // page (defence-in-depth against reflected markup in the token slot).
+    let token = query.token;
+    if token.is_empty() || token.len() > 128 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return magic_confirm_page(None);
     }
+    magic_confirm_page(Some(&token))
+}
+
+/// `POST /auth/magic/verify/confirm`: the confirm-page button target. Consumes
+/// the token (single-use), mints the capability link, and hands it to the
+/// dashboard window that opened it via `postMessage`, mirroring the OAuth
+/// popup. Form-encoded so a plain HTML button submits it with no JavaScript.
+async fn magic_verify_confirm(
+    State(state): State<AppState>,
+    Form(request): Form<MagicVerifyRequest>,
+) -> Response {
     let store = state.store.clone();
-    let token = query.token.clone();
+    let token = request.token;
     match tokio::task::spawn_blocking(move || verify_magic(&store, &token)).await {
         Ok(Ok(Some((account_id, link)))) => {
             info!(account = %account_id, "magic sign-in");
@@ -2456,6 +2483,36 @@ async fn magic_verify_get(
         ),
         _ => oauth_popup(&state.dashboard_origin, magic_err("server error")),
     }
+}
+
+/// The confirm page the emailed link opens: a single button that POSTs the
+/// token to consume it. `token` is `None` when the query token was malformed
+/// (the button then submits an empty token and the POST reports it expired).
+/// Asks the browser to send no referrer so the token never leaks via the
+/// `Referer` header on any sub-resource load.
+fn magic_confirm_page(token: Option<&str>) -> Response {
+    // Caller validated `token` as bounded hex, so it is safe in the attribute.
+    let token = token.unwrap_or("");
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"referrer\" content=\"no-referrer\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>Carillon</title></head>\
+         <body style=\"font-family:system-ui,sans-serif;padding:2rem;text-align:center\">\
+         <p>Confirm sign in to Carillon.</p>\
+         <form method=\"post\" action=\"/auth/magic/verify/confirm\">\
+         <input type=\"hidden\" name=\"token\" value=\"{token}\">\
+         <button type=\"submit\" style=\"font-size:1rem;padding:.6rem 1.2rem;cursor:pointer\">Sign in</button>\
+         </form></body></html>"
+    );
+    (
+        [
+            ("content-type", "text/html; charset=utf-8"),
+            ("referrer-policy", "no-referrer"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// A content-free error payload for the magic-link popup.
@@ -2820,6 +2877,47 @@ fn default_limit() -> u32 {
 
 fn default_packs() -> i64 {
     1
+}
+
+#[cfg(test)]
+mod magic_verify_tests {
+    use axum::body::to_bytes;
+    use axum::extract::Query;
+
+    use super::{MagicVerifyQuery, magic_verify_get};
+
+    async fn body_of(resp: axum::response::Response) -> String {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_renders_confirm_form_without_consuming() {
+        // The handler takes no store, so it structurally cannot consume the
+        // token; a valid hex token is reflected into a POST-to-confirm form.
+        let token = "a".repeat(64);
+        let resp = magic_verify_get(Query(MagicVerifyQuery {
+            token: token.clone(),
+        }))
+        .await;
+        let html = body_of(resp).await;
+        assert!(html.contains("action=\"/auth/magic/verify/confirm\""));
+        assert!(html.contains("method=\"post\""));
+        assert!(html.contains(&format!("value=\"{token}\"")));
+        assert!(html.contains("no-referrer"));
+    }
+
+    #[tokio::test]
+    async fn get_never_reflects_a_non_hex_token() {
+        // A token carrying markup is refused, never echoed into the page.
+        let resp = magic_verify_get(Query(MagicVerifyQuery {
+            token: "\"><script>alert(1)</script>".into(),
+        }))
+        .await;
+        let html = body_of(resp).await;
+        assert!(!html.contains("<script>alert"));
+        assert!(html.contains("value=\"\""));
+    }
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, str::FromStr};
 
 use age::x25519::{Identity, Recipient};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
@@ -21,33 +21,49 @@ pub struct Crypto {
 }
 
 impl Crypto {
-    /// Loads the age identity at `path`, generating and persisting a
-    /// fresh one (mode `0600`) if it does not exist.
-    pub fn load_or_create(path: &Path) -> Result<Self> {
-        let identity = if path.exists() {
-            let text = fs::read_to_string(path)
-                .with_context(|| format!("Cannot read age key at {}", path.display()))?;
-            Identity::from_str(text.trim()).map_err(|e| anyhow!("Invalid age key: {e}"))?
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Cannot create {}", parent.display()))?;
-            }
+    /// Loads an existing age identity from `path`, erroring if the file is
+    /// missing. The daemon uses this directly when the store already holds
+    /// credentials, so it never silently mints a new key over them; use
+    /// [`Crypto::generate`] to create one deliberately.
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("Cannot read age key at {}", path.display()))?;
+        let identity =
+            Identity::from_str(text.trim()).map_err(|e| anyhow!("Invalid age key: {e}"))?;
+        Ok(Self::from_identity(identity))
+    }
 
-            let identity = Identity::generate();
-            let secret = identity.to_string();
-            fs::write(path, secret.expose_secret())
-                .with_context(|| format!("Cannot write age key at {}", path.display()))?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-                .context("Cannot restrict age key permissions")?;
-            identity
-        };
+    /// Generates a fresh age identity and persists it at `path` (mode
+    /// `0600`, creating parent directories). Refuses to overwrite an
+    /// existing key, so it is safe to invoke deliberately (`keygen`) or on
+    /// a genuinely-fresh store.
+    pub fn generate(path: &Path) -> Result<Self> {
+        if path.exists() {
+            bail!(
+                "age key already exists at {}; refusing to overwrite",
+                path.display()
+            );
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Cannot create {}", parent.display()))?;
+        }
+        let identity = Identity::generate();
+        let secret = identity.to_string();
+        fs::write(path, secret.expose_secret())
+            .with_context(|| format!("Cannot write age key at {}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .context("Cannot restrict age key permissions")?;
+        Ok(Self::from_identity(identity))
+    }
 
+    /// Builds the encryptor from a loaded identity.
+    fn from_identity(identity: Identity) -> Self {
         let recipient = identity.to_public();
-        Ok(Self {
+        Self {
             identity,
             recipient,
-        })
+        }
     }
 
     /// Encrypts a password into a base64 blob for the database.
@@ -100,7 +116,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
-        let crypto = Crypto::load_or_create(&path).unwrap();
+        let crypto = Crypto::generate(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         crypto
     }

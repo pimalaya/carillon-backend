@@ -18,6 +18,9 @@ use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 use url::{Host, Url};
 
+use secrecy::ExposeSecret;
+
+use crate::crypto::Crypto;
 use crate::event::ChangeEvent;
 use crate::live::{LiveBus, LiveEvent, Routed};
 use crate::store::{DeliveryOutcome, Store, Watch};
@@ -36,6 +39,7 @@ const CONCURRENCY: usize = 64;
 pub async fn run(
     mut events: mpsc::Receiver<ChangeEvent>,
     store: Arc<Store>,
+    crypto: Arc<Crypto>,
     client: Client,
     live: LiveBus,
 ) {
@@ -48,17 +52,24 @@ pub async fn run(
             .await
             .expect("delivery semaphore never closes");
         let store = store.clone();
+        let crypto = crypto.clone();
         let client = client.clone();
         let live = live.clone();
 
         tokio::spawn(async move {
-            deliver(store, client, event, live).await;
+            deliver(store, crypto, client, event, live).await;
             drop(permit);
         });
     }
 }
 
-async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: LiveBus) {
+async fn deliver(
+    store: Arc<Store>,
+    crypto: Arc<Crypto>,
+    client: Client,
+    event: ChangeEvent,
+    live: LiveBus,
+) {
     let account = event.account.clone();
 
     // NOTE: the store is the source of truth for the endpoint and
@@ -87,8 +98,17 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
     // NOTE: sign the timestamped preimage `t.body` with every
     // currently-valid secret (current, plus the previous during a
     // rotation overlap), so a mid-rotation receiver validates against
-    // either.
-    let signature = sign(&watch.signing_secrets(now_secs()), event.ts, &body);
+    // either. Secrets are decrypted just-in-time into zeroize-on-drop
+    // strings that live only for this signing.
+    let secrets = match watch.signing_secrets(&crypto, now_secs()) {
+        Ok(secrets) => secrets,
+        Err(err) => {
+            warn!(account = %event.account, error = %err, "delivery skipped: cannot decrypt signing secret");
+            return;
+        }
+    };
+    let secret_refs: Vec<&str> = secrets.iter().map(|s| s.expose_secret()).collect();
+    let signature = sign(&secret_refs, event.ts, &body);
 
     let mut attempts = 0;
     let mut last_status = None;
@@ -189,7 +209,7 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
 /// like a change delivery, but not retried, since a notice is advisory
 /// and the same state recurs on the next tick. Reuses the
 /// change-delivery signature scheme.
-pub async fn deliver_notice(client: &Client, watch: &Watch, kind: &str) {
+pub async fn deliver_notice(client: &Client, crypto: &Crypto, watch: &Watch, kind: &str) {
     let ts = now_secs();
     let body = serde_json::to_vec(&json!({
         "type": "notice",
@@ -198,7 +218,15 @@ pub async fn deliver_notice(client: &Client, watch: &Watch, kind: &str) {
         "ts": ts,
     }))
     .expect("notice always serializes");
-    let signature = sign(&watch.signing_secrets(ts), ts, &body);
+    let secrets = match watch.signing_secrets(crypto, ts) {
+        Ok(secrets) => secrets,
+        Err(err) => {
+            warn!(account = %watch.id, kind, error = %err, "notice skipped: cannot decrypt signing secret");
+            return;
+        }
+    };
+    let secret_refs: Vec<&str> = secrets.iter().map(|s| s.expose_secret()).collect();
+    let signature = sign(&secret_refs, ts, &body);
 
     let result = client
         .post(&watch.notify_url)

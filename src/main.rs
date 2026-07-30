@@ -11,11 +11,13 @@
 //! [`store`]. The [`api`] manages watches at runtime; [`crypto`]
 //! encrypts passwords at rest.
 //!
-//! Two subcommands:
+//! Subcommands:
 //!
 //! - `carillon-server serve [config]` (the default) runs the daemon.
 //! - `carillon-server import <accounts.toml> [config]` populates the store from
 //!   an [`config::ImportFile`] and exits.
+//! - `carillon-server keygen [config]` deliberately generates the age key
+//!   (mode `0600`) at the configured path and exits.
 
 mod api;
 mod billing;
@@ -100,6 +102,10 @@ async fn main() -> Result<()> {
             let config = load_config(args.get(2).map(String::as_str))?;
             serve(config).await
         }
+        Some("keygen") => {
+            let config = load_config(args.get(2).map(String::as_str))?;
+            keygen(&config)
+        }
         // NOTE: no subcommand or a bare config path both serve, for
         // convenience (`carillon-server` / `carillon-server carillon.toml`).
         Some(flag) if flag.starts_with('-') => bail!("unknown flag: {flag}"),
@@ -120,6 +126,42 @@ fn load_config(explicit: Option<&str>) -> Result<Config> {
     Config::load(path.as_ref()).with_context(|| format!("Cannot load config at {path}"))
 }
 
+/// Opens the age identity for `store`, failing closed. Loads an existing
+/// key; when none exists it auto-creates one ONLY for a genuinely-fresh
+/// store (no credentials yet). If the key is missing but the store already
+/// holds credentials it refuses to start rather than mint a new key, which
+/// would orphan every stored credential (§ hardening, age-key custody).
+fn open_crypto(store: &Store, path: &Path) -> Result<Crypto> {
+    if path.exists() {
+        Crypto::load(path)
+    } else if store.has_credentials()? {
+        bail!(
+            "age key missing at {} but the store already holds encrypted \
+             credentials. Refusing to start and generate a fresh key, which would \
+             orphan every credential. Restore the age key (e.g. from sops or your \
+             backup), or run `carillon-server keygen` on a genuinely-fresh store.",
+            path.display()
+        )
+    } else {
+        info!(
+            path = %path.display(),
+            "no age key and an empty store; generating a fresh key (mode 0600)"
+        );
+        Crypto::generate(path)
+    }
+}
+
+/// Deliberately generates the age key at the configured path, mode `0600`,
+/// so an operator creates it on purpose rather than by first-run accident.
+/// Refuses to overwrite an existing key.
+fn keygen(config: &Config) -> Result<()> {
+    let path = config.server.age_key_path();
+    Crypto::generate(&path)
+        .with_context(|| format!("Cannot generate age key at {}", path.display()))?;
+    info!(path = %path.display(), "generated age key (mode 0600)");
+    Ok(())
+}
+
 /// Runs the daemon: watchers, delivery worker and control API.
 async fn serve(config: Config) -> Result<()> {
     // NOTE: set egress policy first; every outbound connect (IMAP +
@@ -131,8 +173,21 @@ async fn serve(config: Config) -> Result<()> {
     let metered = config.billing.stripe.is_some();
 
     let store = Arc::new(Store::open(&config.server.db_path()).context("Cannot open store")?);
-    let crypto =
-        Arc::new(Crypto::load_or_create(&config.server.age_key_path()).context("Cannot load key")?);
+    let crypto = Arc::new(
+        open_crypto(&store, &config.server.age_key_path()).context("Cannot open age key")?,
+    );
+
+    // NOTE: encrypt any legacy plaintext HMAC secret in place before the
+    // delivery loop can sign with it (idempotent; a no-op once migrated).
+    let migrated = store
+        .encrypt_legacy_hmac_secrets(&crypto)
+        .context("Cannot encrypt legacy HMAC secrets")?;
+    if migrated > 0 {
+        info!(
+            watches = migrated,
+            "encrypted legacy plaintext HMAC secrets"
+        );
+    }
 
     // NOTE: shared TLS config, one verifier and one session cache for
     // every held IMAP connection and the read-only `/test` probe.
@@ -158,6 +213,7 @@ async fn serve(config: Config) -> Result<()> {
     tokio::spawn(delivery::run(
         event_rx,
         store.clone(),
+        crypto.clone(),
         http.clone(),
         live_tx.clone(),
     ));
@@ -166,6 +222,7 @@ async fn serve(config: Config) -> Result<()> {
     // (disabled when unmetered).
     tokio::spawn(metering::run(
         store.clone(),
+        crypto.clone(),
         live_tx.clone(),
         http.clone(),
         mailer.clone(),
@@ -356,7 +413,10 @@ async fn serve(config: Config) -> Result<()> {
 fn import(config: &Config, path: &Path) -> Result<()> {
     let store = Store::open(&config.server.db_path()).context("Cannot open store")?;
     let crypto =
-        Crypto::load_or_create(&config.server.age_key_path()).context("Cannot load key")?;
+        open_crypto(&store, &config.server.age_key_path()).context("Cannot open age key")?;
+    store
+        .encrypt_legacy_hmac_secrets(&crypto)
+        .context("Cannot encrypt legacy HMAC secrets")?;
     let file = ImportFile::load(path)?;
 
     let mut imported = 0;
@@ -378,8 +438,8 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             enc_password,
             mailbox: account.mailbox.clone(),
             notify_url: account.notify_url.clone(),
-            hmac_secret: account.hmac_secret.clone(),
-            hmac_secret_prev: None,
+            enc_hmac_secret: crypto.encrypt(&account.hmac_secret)?,
+            enc_hmac_secret_prev: None,
             hmac_secret_prev_expires: None,
             // NOTE: one watch, one billing account until grouped (M7).
             account_id: id.clone(),

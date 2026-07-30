@@ -16,14 +16,15 @@ it." Each zone carries a status: 🟢 handled · 🟡 partial · 🔴 open/defer
 ⚪ inherent trust (cannot be removed, only bounded).
 
 ## Layer 1 — The crown jewels (the target)
-- **Credential store** (`carillon.db`): mailbox **passwords & OAuth tokens**, held
-  **age-encrypted** (ciphertext at rest). The asset worth stealing. 🟢 encrypted at
-  rest; plaintext residency minimised (decrypt just-in-time, zeroize — see
-  [[hardening]]).
-- **Cleartext alongside them in the same DB**: account emails, logins, mail-server
-  hosts, mailbox names, webhook URLs, and per-watch **HMAC signing secrets**. Not
-  passwords, but real PII + webhook-forgery secrets. 🟡 in the clear on disk;
-  matters for backups and provider snapshots (Layer 7).
+- **Credential store** (`carillon.db`): mailbox **passwords & OAuth tokens** plus the
+  per-watch **HMAC signing secret** (webhook-forgery key), all held **age-encrypted**
+  (ciphertext at rest). The assets worth stealing. 🟢 encrypted at rest; plaintext
+  residency minimised (decrypt just-in-time, zeroize — see [[hardening]]).
+- **Cleartext PII alongside them in the same DB**: account emails, logins,
+  mail-server hosts, mailbox names, webhook URLs. Not secrets — no capability — but
+  real PII (a deanonymisation / phishing-target list). 🟡 in the clear on disk by
+  **deliberate decision**; it matters for backups and provider snapshots (Layer 7),
+  but a leaked cold copy is now **capability-inert** (every *secret* is ciphertext).
 
 ## Layer 2 — The key chain that unlocks it
 Three distinct keys, two of them on-box "decrypt-everything" keys:
@@ -31,9 +32,10 @@ Three distinct keys, two of them on-box "decrypt-everything" keys:
 - **Host SSH key** (`/etc/ssh/ssh_host_ed25519_key`) — what sops uses to decrypt
   **all** secrets **at runtime on the box**; also the SSH host identity. **On-box**,
   doubly load-bearing. 🔴 whoever holds it decrypts every secret.
-- **Carillon age key** — decrypts the **mailbox credentials**. On-box (tmpfs);
-  **must be backed up out-of-band, never in the DB backup bucket**. 🟡 losing it
-  bricks every watch; leaking it + a DB dump is full credential compromise.
+- **Carillon age key** — decrypts the **mailbox credentials and the per-watch HMAC
+  signing secrets**. On-box (tmpfs); **must be backed up out-of-band, never in the DB
+  backup bucket**. 🟡 losing it bricks every watch; leaking it + a DB dump is full
+  credential compromise.
 
 ## Layer 3 — Host access (the perimeter)
 - **SSH**: 🟢 root-only, **key-only, no password** (`PasswordAuthentication=false`,
@@ -55,6 +57,9 @@ Three distinct keys, two of them on-box "decrypt-everything" keys:
   compiled to exclude the dev bypass in release (see [[auth]]).
 - **Auth flows** (magic-link, capability-link session token in `localStorage`):
   🟡 account-takeover surface via magic-link email interception or dashboard XSS.
+  The magic-link **prefetch/scanner token-burn** availability gap is closed — the
+  emailed `GET` no longer consumes the token (click-to-confirm `POST`; see [[auth]]).
+  Interception and `localStorage`-XSS takeover remain 🟡, tracked separately.
 
 ## Layer 5 — Outbound / SSRF
 - The server originates connections to caller-supplied hosts/URLs. 🟢 guarded by
@@ -102,6 +107,18 @@ SHALL be blast-radius reducers: scoped read-only OAuth / app-passwords (never a
 primary password — [[credential-custody-boundary]]), content-free payloads,
 read-only posture, and per-service credential isolation, so a breach leaks
 **signals, not mail**, and cannot write/send/delete.
+
+### Requirement: secrets at rest use per-field age encryption, not whole-file
+Confidentiality of secrets at rest SHALL be per-field age encryption with
+just-in-time decryption into zeroize-on-drop values, and every stored *secret*
+(mailbox credentials + per-watch HMAC signing secret) SHALL be so encrypted; only
+PII and structural/temporal/operational columns remain cleartext. Whole-database
+encryption (SQLCipher and equivalents) SHALL NOT be adopted: against the on-box live
+adversary it is equivalent (the key is resident either way — Layer 2), while it would
+forfeit the minimal-plaintext-residency property that per-field JIT decryption gives
+the crown jewels. The operator's cold-copy backup (`VACUUM INTO` + off-box copy, age
+key held out-of-band) therefore carries **no usable secret** — only the accepted PII
+residual.
 
 ### Requirement: Untrusted-server parsing is a first-class attack surface
 The IMAP/CardDAV parsers consume data from arbitrary, user-chosen (thus

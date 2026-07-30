@@ -10,8 +10,10 @@ use std::{path::Path, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 
+use crate::crypto::Crypto;
 use crate::util::now_secs;
 
 const SCHEMA: &str = "
@@ -23,8 +25,8 @@ CREATE TABLE IF NOT EXISTS watch (
   enc_password TEXT NOT NULL,
   mailbox      TEXT NOT NULL,
   notify_url   TEXT NOT NULL,
-  hmac_secret  TEXT NOT NULL,
-  hmac_secret_prev         TEXT,
+  enc_hmac_secret          TEXT NOT NULL,
+  enc_hmac_secret_prev     TEXT,
   hmac_secret_prev_expires INTEGER,
   account_id   TEXT NOT NULL DEFAULT '',
   -- The provider domain this service is grouped + trial-gated under: the
@@ -233,12 +235,12 @@ pub struct Watch {
     pub mailbox: String,
     /// Notify URL to POST signed events to.
     pub notify_url: String,
-    /// Shared secret used to HMAC-sign deliveries.
-    pub hmac_secret: String,
+    /// Base64 age-encrypted shared secret used to HMAC-sign deliveries.
+    pub enc_hmac_secret: String,
     /// The previous HMAC secret during a rotation overlap, still
-    /// accepted by receivers until it expires.
-    pub hmac_secret_prev: Option<String>,
-    /// Unix time (seconds) at which `hmac_secret_prev` stops being
+    /// accepted by receivers until it expires. Base64 age-encrypted.
+    pub enc_hmac_secret_prev: Option<String>,
+    /// Unix time (seconds) at which `enc_hmac_secret_prev` stops being
     /// signed with.
     pub hmac_secret_prev_expires: Option<i64>,
     /// The billing account this watch draws watch-time from. Defaults to
@@ -280,8 +282,8 @@ impl Watch {
             enc_password: row.get("enc_password")?,
             mailbox: row.get("mailbox")?,
             notify_url: row.get("notify_url")?,
-            hmac_secret: row.get("hmac_secret")?,
-            hmac_secret_prev: row.get("hmac_secret_prev")?,
+            enc_hmac_secret: row.get("enc_hmac_secret")?,
+            enc_hmac_secret_prev: row.get("enc_hmac_secret_prev")?,
             hmac_secret_prev_expires: row.get("hmac_secret_prev_expires")?,
             account_id: row.get("account_id")?,
             provider: row.get("provider")?,
@@ -299,14 +301,19 @@ impl Watch {
     /// The secrets a delivery should be signed with right now: the
     /// current one, plus the previous one while its overlap window is
     /// open, so a receiver mid-rotation validates against either.
-    pub fn signing_secrets(&self, now: i64) -> Vec<&str> {
-        let mut secrets = vec![self.hmac_secret.as_str()];
-        if let (Some(prev), Some(expires)) = (&self.hmac_secret_prev, self.hmac_secret_prev_expires)
+    ///
+    /// The stored secrets are age-encrypted; they are decrypted here
+    /// just-in-time into zeroize-on-drop [`SecretString`]s so a plaintext
+    /// signing secret never lingers past the delivery it signs.
+    pub fn signing_secrets(&self, crypto: &Crypto, now: i64) -> Result<Vec<SecretString>> {
+        let mut secrets = vec![crypto.decrypt_secret(&self.enc_hmac_secret)?];
+        if let (Some(prev), Some(expires)) =
+            (&self.enc_hmac_secret_prev, self.hmac_secret_prev_expires)
             && now < expires
         {
-            secrets.push(prev.as_str());
+            secrets.push(crypto.decrypt_secret(prev)?);
         }
-        secrets
+        Ok(secrets)
     }
 }
 
@@ -520,13 +527,13 @@ impl Store {
         self.lock().execute(
             "INSERT INTO watch
                (id, imap_host, imap_port, login, enc_password, mailbox, notify_url,
-                hmac_secret, hmac_secret_prev, hmac_secret_prev_expires, account_id,
+                enc_hmac_secret, enc_hmac_secret_prev, hmac_secret_prev_expires, account_id,
                 auth_kind, active, source_kind, carddav_url, carddav_poll_secs, provider)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
                imap_host=?2, imap_port=?3, login=?4, enc_password=?5,
-               mailbox=?6, notify_url=?7, hmac_secret=?8,
-               hmac_secret_prev=?9, hmac_secret_prev_expires=?10,
+               mailbox=?6, notify_url=?7, enc_hmac_secret=?8,
+               enc_hmac_secret_prev=?9, hmac_secret_prev_expires=?10,
                account_id=?11, auth_kind=?12, active=?13,
                source_kind=?14, carddav_url=?15, carddav_poll_secs=?16, provider=?17",
             params![
@@ -537,8 +544,8 @@ impl Store {
                 watch.enc_password,
                 watch.mailbox,
                 watch.notify_url,
-                watch.hmac_secret,
-                watch.hmac_secret_prev,
+                watch.enc_hmac_secret,
+                watch.enc_hmac_secret_prev,
                 watch.hmac_secret_prev_expires,
                 watch.account_id,
                 watch.auth_kind,
@@ -555,24 +562,64 @@ impl Store {
     /// Rotates a watch's HMAC secret, keeping the current one as the
     /// previous secret for an `overlap` window so a receiver can update
     /// without dropping events. Returns the expiry of the overlap, or
-    /// `None` if no watch matched.
+    /// `None` if no watch matched. `enc_new_secret` is the age-encrypted
+    /// new secret (the caller encrypts before calling); the current
+    /// ciphertext is copied verbatim into the previous slot.
     pub fn rotate_secret(
         &self,
         id: &str,
-        new_secret: &str,
+        enc_new_secret: &str,
         overlap: Duration,
     ) -> Result<Option<i64>> {
         let now = now_secs();
         let expires = now + overlap.as_secs() as i64;
         let n = self.lock().execute(
             "UPDATE watch
-               SET hmac_secret_prev = hmac_secret,
+               SET enc_hmac_secret_prev = enc_hmac_secret,
                    hmac_secret_prev_expires = ?2,
-                   hmac_secret = ?3
+                   enc_hmac_secret = ?3
              WHERE id = ?1",
-            params![id, expires, new_secret],
+            params![id, expires, enc_new_secret],
         )?;
         Ok((n > 0).then_some(expires))
+    }
+
+    /// One-time, idempotent backfill that encrypts any legacy plaintext
+    /// HMAC secret left over from before the secret was stored encrypted.
+    /// A value that already decrypts cleanly is ciphertext and is skipped;
+    /// one that fails to decrypt is treated as plaintext and encrypted in
+    /// place. Returns the number of rows rewritten. SHALL run at startup
+    /// once the age key is loaded, before any delivery is signed.
+    pub fn encrypt_legacy_hmac_secrets(&self, crypto: &Crypto) -> Result<usize> {
+        let conn = self.lock();
+        let rows: Vec<(String, String, Option<String>)> = {
+            let mut stmt =
+                conn.prepare("SELECT id, enc_hmac_secret, enc_hmac_secret_prev FROM watch")?;
+            let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut rewritten = 0;
+        for (id, cur, prev) in rows {
+            let enc_cur = if crypto.decrypt(&cur).is_ok() {
+                None
+            } else {
+                Some(crypto.encrypt(&cur)?)
+            };
+            let enc_prev = match &prev {
+                Some(p) if crypto.decrypt(p).is_err() => Some(crypto.encrypt(p)?),
+                _ => None,
+            };
+            if enc_cur.is_none() && enc_prev.is_none() {
+                continue;
+            }
+            conn.execute(
+                "UPDATE watch SET enc_hmac_secret = ?2, enc_hmac_secret_prev = ?3 WHERE id = ?1",
+                params![id, enc_cur.unwrap_or(cur), enc_prev.or(prev),],
+            )?;
+            rewritten += 1;
+        }
+        Ok(rewritten)
     }
 
     /// Returns every active watch, in declaration order (`rowid` =
@@ -1400,6 +1447,24 @@ impl Store {
             .optional()?;
         Ok(enc)
     }
+
+    /// Whether the store holds any encrypted credential — a watch password,
+    /// a stored password credential, or an OAuth refresh token. The daemon
+    /// checks this to fail closed: a store with credentials must never come
+    /// up under a freshly-generated age key, which would orphan every one
+    /// of them (§ hardening, age-key custody).
+    pub fn has_credentials(&self) -> Result<bool> {
+        let conn = self.lock();
+        let has: bool = conn.query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM watch WHERE enc_password <> '')
+                OR EXISTS(SELECT 1 FROM password_credential)
+                OR EXISTS(SELECT 1 FROM oauth_credential)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(has)
+    }
 }
 
 /// SHA-256 hex of a capability token, what is persisted, so a DB leak
@@ -1440,8 +1505,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // NOTE: the HMAC signing secret and its rotation predecessor became
+    // age-encrypted (enc_hmac_secret / enc_hmac_secret_prev). Rename the
+    // plaintext columns in place; the crypto-aware backfill that encrypts
+    // the values themselves runs later, once the age key is loaded (see
+    // `Store::encrypt_legacy_hmac_secrets`).
+    if column_exists(conn, "watch", "hmac_secret")? {
+        conn.execute_batch("ALTER TABLE watch RENAME COLUMN hmac_secret TO enc_hmac_secret;")?;
+    }
+    if column_exists(conn, "watch", "hmac_secret_prev")? {
+        conn.execute_batch(
+            "ALTER TABLE watch RENAME COLUMN hmac_secret_prev TO enc_hmac_secret_prev;",
+        )?;
+    }
+
     for (table, column, decl) in [
-        ("watch", "hmac_secret_prev", "TEXT"),
+        ("watch", "enc_hmac_secret_prev", "TEXT"),
         ("watch", "hmac_secret_prev_expires", "INTEGER"),
         ("watch", "account_id", "TEXT NOT NULL DEFAULT ''"),
         ("watch", "provider", "TEXT NOT NULL DEFAULT ''"),
@@ -1520,6 +1599,60 @@ mod tests {
             std::env::temp_dir().join(format!("carillon-test-{}-{n}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         Store::open(&path).unwrap()
+    }
+
+    /// A throwaway age encryptor on a unique temp-file path.
+    fn temp_crypto() -> Crypto {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("carillon-test-{}-{n}.key", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let crypto = Crypto::generate(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        crypto
+    }
+
+    #[test]
+    fn encrypt_legacy_hmac_secrets_backfills_and_is_idempotent() {
+        use secrecy::ExposeSecret;
+
+        let store = temp_store();
+        let crypto = temp_crypto();
+        store.ensure_account("acc", None).unwrap();
+
+        // A legacy row: the secret and its rotation predecessor held as
+        // plaintext, as older stores did.
+        let mut w = watch("w1", "acc");
+        w.enc_hmac_secret = "plain-current".into();
+        w.enc_hmac_secret_prev = Some("plain-prev".into());
+        w.hmac_secret_prev_expires = Some(now_secs() + 3600);
+        store.upsert_watch(&w).unwrap();
+
+        // First pass encrypts both; the stored values are no longer
+        // plaintext yet still decrypt back to the originals.
+        assert_eq!(store.encrypt_legacy_hmac_secrets(&crypto).unwrap(), 1);
+        let got = store.get_watch("w1").unwrap().unwrap();
+        assert_ne!(got.enc_hmac_secret, "plain-current");
+        let secrets = got.signing_secrets(&crypto, now_secs()).unwrap();
+        let exposed: Vec<&str> = secrets.iter().map(|s| s.expose_secret()).collect();
+        assert_eq!(exposed, vec!["plain-current", "plain-prev"]);
+
+        // Second pass is a no-op: everything already decrypts.
+        assert_eq!(store.encrypt_legacy_hmac_secrets(&crypto).unwrap(), 0);
+    }
+
+    #[test]
+    fn has_credentials_reflects_stored_secrets() {
+        let store = temp_store();
+        // A genuinely-fresh store holds no crown-jewel-encrypted secrets, so
+        // the daemon may safely auto-create an age key.
+        assert!(!store.has_credentials().unwrap());
+        // Once any credential is stored, has_credentials must report it so
+        // the daemon fails closed on a missing key.
+        store
+            .upsert_password_credential("acc", "u@x", "enc")
+            .unwrap();
+        assert!(store.has_credentials().unwrap());
     }
 
     #[test]
@@ -1624,8 +1757,8 @@ mod tests {
             enc_password: String::new(),
             mailbox: "INBOX".into(),
             notify_url: "https://x/hook".into(),
-            hmac_secret: "s".into(),
-            hmac_secret_prev: None,
+            enc_hmac_secret: "s".into(),
+            enc_hmac_secret_prev: None,
             hmac_secret_prev_expires: None,
             account_id: account_id.into(),
             provider: "x".into(),

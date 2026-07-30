@@ -47,6 +47,14 @@ On successful `POST /auth`, Carillon SHALL mint a capability link: a long, ungue
 ### Requirement: Capability link supports rotation and expiry
 Carillon SHALL support minting, rotating, and expiring a capability link server-side, so a link's lifetime is bounded and a compromised link can be replaced without abandoning the account. Recovery is re-auth to any member mailbox, which re-mints the account's link.
 
+### Requirement: Magic-link verification is prefetch-safe and single-use
+The magic-link email carries a single-use, hashed-at-rest, short-TTL token. It SHALL be consumed only by an explicit human action, never by a bare `GET` of the emailed URL: `GET /auth/magic/verify` SHALL render a click-to-confirm page and SHALL NOT verify or consume the token (its handler holds no store, so it cannot spend it), while a dedicated `POST /auth/magic/verify/confirm` performs the single-use verify. The confirm page SHALL be a plain form with no auto-submit, so email security scanners (SafeLinks, corporate proxies/AV) and browser link-prefetchers — which issue the GET but never submit — cannot burn the token before the human clicks. The token SHALL be reflected into the page only after validation as bounded lowercase hex, and the verification responses SHALL set `Referrer-Policy: no-referrer` so the query-string token does not leak via `Referer`. The programmatic JSON `POST /auth/magic/verify` (dashboard/SPA) is unaffected.
+
+#### Scenario: A scanner or prefetch fetches the emailed link
+- **GIVEN** a valid, unspent magic-link token
+- **WHEN** the emailed `GET` URL is fetched by a link scanner or prefetcher
+- **THEN** a confirm page is returned, the token is not consumed, and the human's later click still signs in
+
 ### Requirement: Sign out revokes the capability link
 `POST /signout` SHALL invalidate the caller's capability link so it no longer authenticates any subsequent call.
 

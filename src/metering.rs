@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+use crate::crypto::Crypto;
 use crate::delivery::deliver_notice;
 use crate::email::Mailer;
 use crate::live::{LiveBus, LiveEvent, NoticeKind, Routed};
@@ -139,8 +140,10 @@ pub fn watch_entitled(watch: &Watch, now: i64) -> bool {
 /// Runs the renewal sweep until cancelled. Disabled (returns
 /// immediately) when `metered` is false, since self-host with the stub
 /// provider is not billed.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     store: Arc<Store>,
+    crypto: Arc<Crypto>,
     live: LiveBus,
     http: reqwest::Client,
     mailer: Arc<Mailer>,
@@ -178,6 +181,7 @@ pub async fn run(
         ticker.tick().await;
         if let Err(err) = sweep(
             &store,
+            &crypto,
             &live,
             &http,
             &mailer,
@@ -204,6 +208,7 @@ pub async fn run(
 #[allow(clippy::too_many_arguments)]
 async fn sweep(
     store: &Store,
+    crypto: &Crypto,
     live: &LiveBus,
     http: &reqwest::Client,
     mailer: &Mailer,
@@ -243,6 +248,7 @@ async fn sweep(
                     let days = ((until - now) as f64 / 86_400.0).ceil().max(0.0) as i64;
                     emit_watch_notice(
                         store,
+                        crypto,
                         live,
                         http,
                         &watch.account_id,
@@ -273,6 +279,7 @@ async fn sweep(
         if stopped_notified.insert(watch.id.clone()) {
             emit_watch_notice(
                 store,
+                crypto,
                 live,
                 http,
                 &watch.account_id,
@@ -341,8 +348,10 @@ async fn sweep(
 
 /// Publishes a per-watch notice on the live bus (dashboard) and as a
 /// signed webhook (so a no-dashboard user is not silently cut off).
+#[allow(clippy::too_many_arguments)]
 async fn emit_watch_notice(
     store: &Store,
+    crypto: &Crypto,
     live: &LiveBus,
     http: &reqwest::Client,
     account_id: &str,
@@ -356,7 +365,7 @@ async fn emit_watch_notice(
         LiveEvent::notice(watch_id, kind, detail),
     ));
     if let Ok(Some(watch)) = store.get_watch(watch_id) {
-        deliver_notice(http, &watch, kind.as_str()).await;
+        deliver_notice(http, crypto, &watch, kind.as_str()).await;
     }
 }
 
