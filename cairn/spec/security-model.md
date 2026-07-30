@@ -27,15 +27,24 @@ it." Each zone carries a status: 🟢 handled · 🟡 partial · 🔴 open/defer
   but a leaked cold copy is now **capability-inert** (every *secret* is ciphertext).
 
 ## Layer 2 — The key chain that unlocks it
-Three distinct keys, two of them on-box "decrypt-everything" keys:
+Distinct keys, one on-box "decrypt-everything" key:
 - **Operator sops key** (age/PGP) — edits `secrets.yaml`. Lives **off-box**. ⚪/🟢
-- **Host SSH key** (`/etc/ssh/ssh_host_ed25519_key`) — what sops uses to decrypt
-  **all** secrets **at runtime on the box**; also the SSH host identity. **On-box**,
-  doubly load-bearing. 🔴 whoever holds it decrypts every secret.
+- **Box sops key** (dedicated age key at `/var/lib/sops-nix/key.txt`) — what sops uses
+  to decrypt **all** secrets at boot. **Decoupled from the SSH host key** (deploy
+  `sops.age.keyFile`): generated offline, staged once, and shreddable from the
+  workstation after a verified boot. 🟢 the decrypt-everything key is now a dedicated,
+  minimally-exposed identity, not the network-facing host key.
+- **Host SSH key** (`/etc/ssh/ssh_host_ed25519_key`) — the box's **SSH identity only**,
+  generated on the box. 🟢 no longer decrypts secrets; obtaining it grants no secret
+  access.
 - **Carillon age key** — decrypts the **mailbox credentials and the per-watch HMAC
   signing secrets**. On-box (tmpfs); **must be backed up out-of-band, never in the DB
   backup bucket**. 🟡 losing it bricks every watch; leaking it + a DB dump is full
   credential compromise.
+- **Residual (inherent):** a live **box-root** compromise still yields every secret
+  (the daemon holds decrypted credentials; the box sops key is on disk to boot
+  unattended). Decoupling removes the *key-in-hand* path, not the on-box-root one —
+  see "On-box access is treated as total compromise".
 
 ## Layer 3 — Host access (the perimeter)
 - **SSH**: 🟢 root-only, **key-only, no password** (`PasswordAuthentication=false`,
@@ -88,14 +97,19 @@ Three distinct keys, two of them on-box "decrypt-everything" keys:
   dependency review are the answers. Dependency review is now an enforced gate:
   `cargo deny check` (advisories + bans + licenses + sources via `deny.toml`) passes
   green, and the **untrusted-server IMAP/CardDAV parsers carry an adversarial-input
-  test harness** in carillon-core (Layer 4). Coverage-guided fuzzing + a CI job that
-  runs `cargo deny` remain follow-ups.
+  test harness** in carillon-core (Layer 4). CI now enforces both: a `cargo deny`
+  audit workflow here (reusable `pimalaya/nix` audit) and a nightly `cargo-fuzz`
+  regression-replay job in carillon-core.
 
 ## Layer 7 — Data beyond the box
-- **Backups**: 🔴 deferred (see [[backup-and-restore]]). When built: a second
-  location holding PII + encrypted creds + HMAC secrets → must be **confidential**
-  and **failure-independent** of the primary (different provider), with the age key
-  never in it.
+- **Backups**: 🟢 a nightly systemd timer writes one consistent SQLite `.backup`
+  snapshot, pulled off-box by a **read-only, SFTP-chrooted `carillon-backup`
+  account** (deploy `configuration.nix`). It is a **pull** model on purpose: the box
+  holds no credential to the backup destination, so a compromise here cannot reach or
+  corrupt the backups; failure-independence is the puller's separate box. The **age
+  key is deliberately excluded** from the snapshot (a DB copy without it cannot
+  decrypt the age-encrypted credentials), and the copy's PII + HMAC secrets are now
+  ciphertext (Layer 1). At-rest confidentiality is the puller's encrypted disk.
 - **Provider snapshots**: 🟡 any auto-snapshot is an unmanaged copy of everything —
   know whether the host takes them.
 
@@ -106,9 +120,10 @@ Three distinct keys, two of them on-box "decrypt-everything" keys:
 ## Trust boundaries, stated plainly
 
 ### Requirement: On-box access is treated as total compromise
-Because the daemon must decrypt credentials unattended, both on-box keys (host SSH
-key, carillon age key) are "decrypt-everything" keys, and a live process holds
-decrypted secrets. Carillon SHALL therefore treat **host/root access as total
+Because the daemon must decrypt credentials unattended, the on-box keys (the box sops
+key and the carillon age key) are "decrypt-everything" keys, and a live process holds
+decrypted secrets. (The SSH host key is no longer among them — it is decoupled to an
+identity-only role, Layer 2.) Carillon SHALL therefore treat **host/root access as total
 compromise** and invest the perimeter accordingly — strong key-only SSH, firewall,
 loopback binds, sane defaults — rather than relying on at-rest encryption to defend
 a live box. At-rest encryption defends **cold theft and backups**, not an on-box
