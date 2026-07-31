@@ -51,6 +51,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
+[dev-dependencies]
+# ServiceExt::oneshot, for driving the router in CORS/handler tests.
+tower = { version = "0.5", features = ["util"] }
+
 [patch.crates-io]
 carillon-core.git = "https://github.com/pimalaya/carillon-core"
 io-imap.git = "https://github.com/pimalaya/io-imap"

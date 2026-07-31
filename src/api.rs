@@ -29,7 +29,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_rustls::TlsConnector;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 
@@ -372,16 +372,22 @@ async fn openapi() -> Response {
     ([(header::CONTENT_TYPE, "application/yaml")], OPENAPI_YAML).into_response()
 }
 
-/// A CORS layer allowing the configured origin (`*` for any) with the
-/// `Authorization` bearer header, for a cross-origin (CDN) dashboard. The
-/// httpOnly `carillon_session` cookie is same-origin only (`SameSite=Strict`);
-/// a cross-origin front therefore keeps the Bearer path.
+/// A CORS layer for a cross-origin dashboard. It sets
+/// `Access-Control-Allow-Credentials: true` so the browser attaches and accepts
+/// the httpOnly `carillon_session` cookie. That header is incompatible with
+/// `Access-Control-Allow-Origin: *`, so `*` mirrors the request origin instead
+/// of a literal star. Safe here because the cookie is `SameSite=Strict` and so
+/// is NOT attached on a cross-*site* request — mirroring cannot hand a foreign
+/// site an authenticated response. This enables a **same-site** cross-origin
+/// front (e.g. `app.` vs `api.` subdomains, or a dev `localhost` port); a truly
+/// cross-site front gets no cookie and keeps the Bearer path.
 fn cors_layer(origin: &str) -> CorsLayer {
     let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_credentials(true);
     match origin {
-        "*" => layer.allow_origin(Any),
+        "*" => layer.allow_origin(AllowOrigin::mirror_request()),
         origin => match origin.parse::<axum::http::HeaderValue>() {
             Ok(value) => layer.allow_origin(value),
             Err(_) => {
@@ -2950,6 +2956,70 @@ fn default_limit() -> u32 {
 
 fn default_packs() -> i64 {
     1
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    use super::cors_layer;
+
+    async fn preflight(origin_config: &str, request_origin: &str) -> axum::http::HeaderMap {
+        let app = Router::new()
+            .route("/me", get(|| async { "ok" }))
+            .layer(cors_layer(origin_config));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/me")
+                    .header("origin", request_origin)
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        res.headers().clone()
+    }
+
+    #[tokio::test]
+    async fn preflight_allows_credentials_for_a_specific_origin() {
+        // The cookie-carrying front needs Access-Control-Allow-Credentials: true
+        // plus the exact origin echoed back (never `*` alongside credentials).
+        let h = preflight("https://app.example.org", "https://app.example.org").await;
+        assert_eq!(
+            h.get("access-control-allow-credentials")
+                .map(|v| v.to_str().unwrap()),
+            Some("true"),
+        );
+        assert_eq!(
+            h.get("access-control-allow-origin")
+                .map(|v| v.to_str().unwrap()),
+            Some("https://app.example.org"),
+        );
+    }
+
+    #[tokio::test]
+    async fn wildcard_mirrors_origin_rather_than_starring_with_credentials() {
+        // `*` must mirror the request origin — a literal `*` with credentials is
+        // rejected by browsers (and tower-http).
+        let h = preflight("*", "https://whatever.example").await;
+        assert_eq!(
+            h.get("access-control-allow-credentials")
+                .map(|v| v.to_str().unwrap()),
+            Some("true"),
+        );
+        assert_eq!(
+            h.get("access-control-allow-origin")
+                .map(|v| v.to_str().unwrap()),
+            Some("https://whatever.example"),
+        );
+    }
 }
 
 #[cfg(test)]
